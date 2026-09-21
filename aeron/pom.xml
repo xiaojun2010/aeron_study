@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>org.example</groupId>
+    <artifactId>aeron</artifactId>
+    <version>1.0-SNAPSHOT</version>
+
+    <properties>
+        <maven.compiler.source>21</maven.compiler.source>
+        <maven.compiler.target>21</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <!--
+            Aeron 版本说明：
+            - 1.44.x 及以上支持 Java 17/21
+            - Aeron 会自动依赖 Agrona（提供 UnsafeBuffer / IdleStrategy 等）
+            - 这里选 1.44.1，稳定且和 Java 21 兼容
+        -->
+        <aeron.version>1.44.1</aeron.version>
+        <log4j.version>2.23.1</log4j.version>
+    </properties>
+
+    <dependencies>
+        <!--
+            aeron-driver：内嵌 MediaDriver 需要（demo01 ~ demo10 都会用到）
+            MediaDriver 是 Aeron 真正的“数据运输引擎”，负责共享内存 / UDP 底层传输。
+        -->
+        <dependency>
+            <groupId>io.aeron</groupId>
+            <artifactId>aeron-driver</artifactId>
+            <version>${aeron.version}</version>
+        </dependency>
+
+        <!--
+            aeron-client：Java 应用与 MediaDriver 通信的客户端
+            提供 Aeron / Publication / Subscription / FragmentHandler 等 API。
+        -->
+        <dependency>
+            <groupId>io.aeron</groupId>
+            <artifactId>aeron-client</artifactId>
+            <version>${aeron.version}</version>
+        </dependency>
+
+        <!--
+            log4j2：所有 demo 的应用日志走这里。
+            Aeron 自身用 java.util.logging，这里通过 log4j-jul 桥把 JUL 也统一到 log4j2。
+        -->
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-api</artifactId>
+            <version>${log4j.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-core</artifactId>
+            <version>${log4j.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-jul</artifactId>
+            <version>${log4j.version}</version>
+        </dependency>
+    </dependencies>
+
+</project>
