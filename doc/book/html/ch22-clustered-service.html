@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 22 章 · 编写一个 Clustered Service</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-light.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/index.min.js"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose" });
+</script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+                 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2em 1em 4em;
+    background: #fafafa;
+    color: #24292f;
+  }
+  .markdown-body {
+    background: #ffffff;
+    padding: 2.5em 3em;
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+  }
+  .markdown-body pre {
+    background: #f6f8fa !important;
+  }
+  .markdown-body pre.mermaid {
+    background: transparent !important;
+    text-align: center;
+    padding: 1em;
+  }
+  nav.chapter-nav {
+    display: flex;
+    justify-content: space-between;
+    padding: 1em;
+    margin-bottom: 1.5em;
+    background: #eef2f7;
+    border-radius: 8px;
+    font-size: 0.95em;
+  }
+  nav.chapter-nav a {
+    color: #0969da;
+    text-decoration: none;
+  }
+  nav.chapter-nav a:hover { text-decoration: underline; }
+  nav.chapter-nav .nav-link { min-width: 30%; }
+  nav.chapter-nav .nav-link.next { text-align: right; }
+  nav.chapter-nav .nav-link.home { text-align: center; }
+</style>
+</head>
+<body>
+<article class="markdown-body">
+<nav class="chapter-nav"><a href="ch21-cluster-overview.html" class="nav-link">← 第 21 章 · Aeron Cluster：概述与 Raft</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch23-deploy-tuning.html" class="nav-link next">第 23 章 · 部署、监控、性能调优 →</a></nav>
+<h1 id="22-clustered-service">第 22 章 · 编写一个 Clustered Service</h1>
+<h2 id="_1">学习目标</h2>
+<ul>
+<li>会实现 <code>ClusteredService</code> 接口的四个核心方法；</li>
+<li>会在单机拉起 3 节点的 Cluster；</li>
+<li>会写 Client 发送请求并收响应；</li>
+<li>学会用 SBE 定义 ingress / egress message；</li>
+<li>明白 Snapshot 的写与读。</li>
+</ul>
+<h2 id="cluster">本章速览：一次请求在 Cluster 里的旅行</h2>
+<pre class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant L as Leader Consensus
+    participant F1 as Follower 1
+    participant F2 as Follower 2
+    participant S as Leader Service
+
+    C->>L: offer(request)
+    L->>L: append 到 log
+    L->>F1: replicate
+    L->>F2: replicate
+    F1-->>L: ack
+    F2-->>L: ack
+    Note over L: quorum 达成 (2/3)
+    L->>S: onSessionMessage(request)
+    S->>S: 更新 state
+    S->>C: session.offer(response)
+    Note over F1,F2: 同时也把消息交给<br/>各自的 Service，同步更新
+</pre>
+
+<p><strong>核心保证</strong>：任何一条消息只有在 <strong>多数派已经写入日志</strong> 后才被交给 Service 执行，保证 leader 挂了后其他节点也能继续。</p>
+<h2 id="221">22.1 依赖</h2>
+<div class="codehilite"><pre><span></span><code><span class="nt">&lt;dependency&gt;</span>
+<span class="w">    </span><span class="nt">&lt;groupId&gt;</span>io.aeron<span class="nt">&lt;/groupId&gt;</span>
+<span class="w">    </span><span class="nt">&lt;artifactId&gt;</span>aeron-cluster<span class="nt">&lt;/artifactId&gt;</span>
+<span class="w">    </span><span class="nt">&lt;version&gt;</span>1.44.1<span class="nt">&lt;/version&gt;</span>
+<span class="nt">&lt;/dependency&gt;</span>
+</code></pre></div>
+
+<p><code>aeron-cluster</code> 自动传染 <code>aeron-archive</code>、<code>aeron-driver</code> 等。</p>
+<h2 id="222-clusteredservice">22.2 最小 ClusteredService</h2>
+<p>我们实现一个计数器：每收到一个"INC"请求，counter++，回复当前值。</p>
+<div class="codehilite"><pre><span></span><code><span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">CounterService</span><span class="w"> </span><span class="kd">implements</span><span class="w"> </span><span class="n">ClusteredService</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">counter</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="n">MutableDirectBuffer</span><span class="w"> </span><span class="n">respBuf</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">UnsafeBuffer</span><span class="p">(</span><span class="k">new</span><span class="w"> </span><span class="kt">byte</span><span class="o">[</span><span class="mi">8</span><span class="o">]</span><span class="p">);</span>
+
+<span class="w">    </span><span class="nd">@Override</span>
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">onStart</span><span class="p">(</span><span class="n">Cluster</span><span class="w"> </span><span class="n">cluster</span><span class="p">,</span><span class="w"> </span><span class="n">Image</span><span class="w"> </span><span class="n">snapshotImage</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">snapshotImage</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">null</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="c1">// 从 snapshot 恢复</span>
+<span class="w">            </span><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="n">snapshotImage</span><span class="p">.</span><span class="na">poll</span><span class="p">((</span><span class="n">buf</span><span class="p">,</span><span class="w"> </span><span class="n">o</span><span class="p">,</span><span class="w"> </span><span class="n">l</span><span class="p">,</span><span class="w"> </span><span class="n">h</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">counter</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">buf</span><span class="p">.</span><span class="na">getLong</span><span class="p">(</span><span class="n">o</span><span class="p">),</span><span class="w"> </span><span class="mi">1</span><span class="p">)</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="n">Thread</span><span class="p">.</span><span class="na">yield</span><span class="p">();</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="nd">@Override</span>
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">onSessionMessage</span><span class="p">(</span>
+<span class="w">        </span><span class="n">ClientSession</span><span class="w"> </span><span class="n">session</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">timestamp</span><span class="p">,</span>
+<span class="w">        </span><span class="n">DirectBuffer</span><span class="w"> </span><span class="n">buffer</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">offset</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">length</span><span class="p">,</span><span class="w"> </span><span class="n">Header</span><span class="w"> </span><span class="n">header</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">        </span><span class="n">counter</span><span class="o">++</span><span class="p">;</span>
+<span class="w">        </span><span class="n">respBuf</span><span class="p">.</span><span class="na">putLong</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">counter</span><span class="p">);</span>
+<span class="w">        </span><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="n">session</span><span class="p">.</span><span class="na">offer</span><span class="p">(</span><span class="n">respBuf</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">8</span><span class="p">)</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="c1">// BackPressure 处理</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="nd">@Override</span>
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">onTakeSnapshot</span><span class="p">(</span><span class="n">ExclusivePublication</span><span class="w"> </span><span class="n">snapshotPublication</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">UnsafeBuffer</span><span class="w"> </span><span class="n">buf</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">UnsafeBuffer</span><span class="p">(</span><span class="k">new</span><span class="w"> </span><span class="kt">byte</span><span class="o">[</span><span class="mi">8</span><span class="o">]</span><span class="p">);</span>
+<span class="w">        </span><span class="n">buf</span><span class="p">.</span><span class="na">putLong</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">counter</span><span class="p">);</span>
+<span class="w">        </span><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="n">snapshotPublication</span><span class="p">.</span><span class="na">offer</span><span class="p">(</span><span class="n">buf</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">8</span><span class="p">)</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="n">Thread</span><span class="p">.</span><span class="na">yield</span><span class="p">();</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="nd">@Override</span><span class="w"> </span><span class="kd">public</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">onSessionOpen</span><span class="p">(</span><span class="n">ClientSession</span><span class="w"> </span><span class="n">s</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">ts</span><span class="p">)</span><span class="w"> </span><span class="p">{}</span>
+<span class="w">    </span><span class="nd">@Override</span><span class="w"> </span><span class="kd">public</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">onSessionClose</span><span class="p">(</span><span class="n">ClientSession</span><span class="w"> </span><span class="n">s</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">ts</span><span class="p">,</span><span class="w"> </span><span class="n">CloseReason</span><span class="w"> </span><span class="n">r</span><span class="p">)</span><span class="w"> </span><span class="p">{}</span>
+<span class="w">    </span><span class="nd">@Override</span><span class="w"> </span><span class="kd">public</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">onTimerEvent</span><span class="p">(</span><span class="kt">long</span><span class="w"> </span><span class="n">correlationId</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">timestamp</span><span class="p">)</span><span class="w"> </span><span class="p">{}</span>
+<span class="w">    </span><span class="nd">@Override</span><span class="w"> </span><span class="kd">public</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">onRoleChange</span><span class="p">(</span><span class="n">Cluster</span><span class="p">.</span><span class="na">Role</span><span class="w"> </span><span class="n">newRole</span><span class="p">)</span><span class="w"> </span><span class="p">{}</span>
+<span class="w">    </span><span class="nd">@Override</span><span class="w"> </span><span class="kd">public</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">onTerminate</span><span class="p">(</span><span class="n">Cluster</span><span class="w"> </span><span class="n">cluster</span><span class="p">)</span><span class="w"> </span><span class="p">{}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>关键点：
+- <code>onStart</code> 处理"从 snapshot 恢复" or "从头开始"；
+- <code>onSessionMessage</code> 是核心业务逻辑；
+- <code>onTakeSnapshot</code> 定期被 Cluster 调用，把 state dump 出来。</p>
+<h2 id="223">22.3 启动一个节点</h2>
+<div class="codehilite"><pre><span></span><code><span class="kd">public</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">runNode</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">nodeId</span><span class="p">,</span><span class="w"> </span><span class="n">String</span><span class="w"> </span><span class="n">clusterHostList</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">File</span><span class="w"> </span><span class="n">baseDir</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">File</span><span class="p">(</span><span class="s">&quot;/tmp/cluster-&quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">nodeId</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">MediaDriver</span><span class="p">.</span><span class="na">Context</span><span class="w"> </span><span class="n">driverCtx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">MediaDriver</span><span class="p">.</span><span class="na">Context</span><span class="p">()</span>
+<span class="w">        </span><span class="p">.</span><span class="na">aeronDirectoryName</span><span class="p">(</span><span class="n">baseDir</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="s">&quot;/driver&quot;</span><span class="p">)</span>
+<span class="w">        </span><span class="p">.</span><span class="na">threadingMode</span><span class="p">(</span><span class="n">ThreadingMode</span><span class="p">.</span><span class="na">SHARED</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">Archive</span><span class="p">.</span><span class="na">Context</span><span class="w"> </span><span class="n">archiveCtx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">Archive</span><span class="p">.</span><span class="na">Context</span><span class="p">()</span>
+<span class="w">        </span><span class="p">.</span><span class="na">archiveDir</span><span class="p">(</span><span class="k">new</span><span class="w"> </span><span class="n">File</span><span class="p">(</span><span class="n">baseDir</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;archive&quot;</span><span class="p">))</span>
+<span class="w">        </span><span class="p">.</span><span class="na">controlChannel</span><span class="p">(</span><span class="s">&quot;aeron:udp?endpoint=localhost:801&quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">nodeId</span><span class="p">)</span>
+<span class="w">        </span><span class="p">.</span><span class="na">replicationChannel</span><span class="p">(</span><span class="s">&quot;aeron:udp?endpoint=localhost:0&quot;</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">ConsensusModule</span><span class="p">.</span><span class="na">Context</span><span class="w"> </span><span class="n">consensusCtx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">ConsensusModule</span><span class="p">.</span><span class="na">Context</span><span class="p">()</span>
+<span class="w">        </span><span class="p">.</span><span class="na">clusterMemberId</span><span class="p">(</span><span class="n">nodeId</span><span class="p">)</span>
+<span class="w">        </span><span class="p">.</span><span class="na">clusterMembers</span><span class="p">(</span><span class="n">clusterHostList</span><span class="p">)</span><span class="w">                  </span><span class="c1">// &quot;0=host0:2000...:2001...&quot;</span>
+<span class="w">        </span><span class="p">.</span><span class="na">clusterDir</span><span class="p">(</span><span class="k">new</span><span class="w"> </span><span class="n">File</span><span class="p">(</span><span class="n">baseDir</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;cluster&quot;</span><span class="p">))</span>
+<span class="w">        </span><span class="p">.</span><span class="na">ingressChannel</span><span class="p">(</span><span class="s">&quot;aeron:udp&quot;</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">ClusteredServiceContainer</span><span class="p">.</span><span class="na">Context</span><span class="w"> </span><span class="n">serviceCtx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">ClusteredServiceContainer</span><span class="p">.</span><span class="na">Context</span><span class="p">()</span>
+<span class="w">        </span><span class="p">.</span><span class="na">clusteredService</span><span class="p">(</span><span class="k">new</span><span class="w"> </span><span class="n">CounterService</span><span class="p">())</span>
+<span class="w">        </span><span class="p">.</span><span class="na">clusterDir</span><span class="p">(</span><span class="k">new</span><span class="w"> </span><span class="n">File</span><span class="p">(</span><span class="n">baseDir</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;cluster&quot;</span><span class="p">));</span>
+
+<span class="w">    </span><span class="c1">// 一起启动</span>
+<span class="w">    </span><span class="k">try</span><span class="w"> </span><span class="p">(</span><span class="n">ClusteredMediaDriver</span><span class="w"> </span><span class="n">clusteredDriver</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ClusteredMediaDriver</span><span class="p">.</span><span class="na">launch</span><span class="p">(</span>
+<span class="w">             </span><span class="n">driverCtx</span><span class="p">,</span><span class="w"> </span><span class="n">archiveCtx</span><span class="p">,</span><span class="w"> </span><span class="n">consensusCtx</span><span class="p">);</span>
+<span class="w">         </span><span class="n">ClusteredServiceContainer</span><span class="w"> </span><span class="n">container</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ClusteredServiceContainer</span><span class="p">.</span><span class="na">launch</span><span class="p">(</span><span class="n">serviceCtx</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">Thread</span><span class="p">.</span><span class="na">currentThread</span><span class="p">().</span><span class="na">join</span><span class="p">();</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><code>clusterMembers</code> 字符串格式（3 节点）：</p>
+<div class="codehilite"><pre><span></span><code>0=localhost:20000,localhost:20001,localhost:20002,localhost:20003,localhost:8000|
+1=localhost:20010,localhost:20011,localhost:20012,localhost:20013,localhost:8001|
+2=localhost:20020,localhost:20021,localhost:20022,localhost:20023,localhost:8002
+</code></pre></div>
+
+<p>每个成员 5 个端口：ingress / consensus / log / snapshot / archive-control（具体版本可能有小差异）。</p>
+<h2 id="224-3">22.4 启动集群（本机 3 节点）</h2>
+<div class="codehilite"><pre><span></span><code>Terminal 1: java CounterCluster 0 &lt;memberList&gt;
+Terminal 2: java CounterCluster 1 &lt;memberList&gt;
+Terminal 3: java CounterCluster 2 &lt;memberList&gt;
+</code></pre></div>
+
+<p>启动后：
+- 3 节点先做 Raft 选举
+- 其中一个变成 leader，另两个 follower
+- 日志里能看到 "role=LEADER" / "role=FOLLOWER"</p>
+<h2 id="225-client">22.5 Client</h2>
+<div class="codehilite"><pre><span></span><code><span class="n">AeronCluster</span><span class="w"> </span><span class="n">client</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">AeronCluster</span><span class="p">.</span><span class="na">connect</span><span class="p">(</span><span class="k">new</span><span class="w"> </span><span class="n">AeronCluster</span><span class="p">.</span><span class="na">Context</span><span class="p">()</span>
+<span class="w">    </span><span class="p">.</span><span class="na">aeron</span><span class="p">(</span><span class="n">aeron</span><span class="p">)</span>
+<span class="w">    </span><span class="p">.</span><span class="na">ingressChannel</span><span class="p">(</span><span class="s">&quot;aeron:udp&quot;</span><span class="p">)</span>
+<span class="w">    </span><span class="p">.</span><span class="na">ingressEndpoints</span><span class="p">(</span><span class="s">&quot;0=localhost:20000,1=localhost:20010,2=localhost:20020&quot;</span><span class="p">)</span>
+<span class="w">    </span><span class="p">.</span><span class="na">egressChannel</span><span class="p">(</span><span class="s">&quot;aeron:udp?endpoint=localhost:0&quot;</span><span class="p">)</span>
+<span class="w">    </span><span class="p">.</span><span class="na">egressListener</span><span class="p">((</span><span class="n">clusterSessionId</span><span class="p">,</span><span class="w"> </span><span class="n">timestamp</span><span class="p">,</span><span class="w"> </span><span class="n">buffer</span><span class="p">,</span><span class="w"> </span><span class="n">offset</span><span class="p">,</span><span class="w"> </span><span class="n">length</span><span class="p">,</span><span class="w"> </span><span class="n">header</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kt">long</span><span class="w"> </span><span class="n">newCounter</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">buffer</span><span class="p">.</span><span class="na">getLong</span><span class="p">(</span><span class="n">offset</span><span class="p">);</span>
+<span class="w">        </span><span class="n">log</span><span class="p">.</span><span class="na">info</span><span class="p">(</span><span class="s">&quot;counter = {}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">newCounter</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}));</span>
+
+<span class="n">UnsafeBuffer</span><span class="w"> </span><span class="n">req</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">UnsafeBuffer</span><span class="p">(</span><span class="k">new</span><span class="w"> </span><span class="kt">byte</span><span class="o">[</span><span class="mi">4</span><span class="o">]</span><span class="p">);</span>
+<span class="n">req</span><span class="p">.</span><span class="na">putInt</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span><span class="w"> </span><span class="c1">// INC 指令 code</span>
+<span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="n">client</span><span class="p">.</span><span class="na">offer</span><span class="p">(</span><span class="n">req</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">4</span><span class="p">)</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="n">Thread</span><span class="p">.</span><span class="na">yield</span><span class="p">();</span>
+<span class="w">    </span><span class="n">client</span><span class="p">.</span><span class="na">pollEgress</span><span class="p">();</span>
+<span class="w">    </span><span class="n">Thread</span><span class="p">.</span><span class="na">sleep</span><span class="p">(</span><span class="mi">200</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>预期输出：<code>counter = 1</code>, <code>counter = 2</code>, ... <code>counter = 5</code>。</p>
+<h2 id="226-fail-over">22.6 演示 fail-over</h2>
+<p><strong>fail-over 时序</strong>：</p>
+<pre class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant A as Node A<br/>(Leader)
+    participant B as Node B
+    participant D as Node C
+
+    C->>A: offer(req)
+    A-->>C: response OK
+    Note over A: 💥 kill -9
+
+    C->>A: offer(req)
+    Note over C: TCP/UDP timeout
+    B->>D: 心跳丢失, 触发选举
+    B->>B: candidate
+    B->>D: RequestVote
+    D-->>B: VoteGranted
+    Note over B: 变成 LEADER
+
+    C->>B: 自动重连
+    C->>B: offer(req)
+    B-->>C: response OK
+</pre>
+
+<ul>
+<li>找到 leader（日志里有 role=LEADER 的进程）</li>
+<li>直接 kill 掉</li>
+<li>剩下两个节点 quorum 依然满足，重新选主（几秒内）</li>
+<li>Client 会短暂断开，然后自动切到新 leader，继续 offer</li>
+</ul>
+<h2 id="227-snapshot">22.7 Snapshot 触发</h2>
+<ul>
+<li>手动：<code>archive</code> 客户端调用 <code>takeSnapshot</code>；</li>
+<li>自动：写多少条日志之后自动 snapshot（Cluster config）；</li>
+<li>Log 会 truncate 到 snapshot 之后，磁盘占用受控。</li>
+</ul>
+<h2 id="228">22.8 常见陷阱</h2>
+<ol>
+<li><strong>member list 端口错开忘了改</strong>：3 节点会互相打不通。</li>
+<li><strong>忘记 <code>aeronDirectoryName</code> 每节点独立</strong>：三节点抢一个 driver 目录 → 崩。</li>
+<li><strong>onSessionMessage 里做 IO</strong>：会阻塞 Raft，慎重；有异步需求走 Ingress → 内部队列 → 单独线程。</li>
+<li><strong>Service 不 deterministic</strong>：使用 <code>Random</code>、System.currentTimeMillis() → 各节点状态发散，Raft 崩溃。<strong>必须用 <code>cluster.time()</code> / <code>cluster.timeUnit()</code>。</strong></li>
+<li><strong>snapshot 拉大</strong>：state 上 GB 时要用 chunked snapshot（多 fragment）。</li>
+</ol>
+<h2 id="229">22.9 确定性执行的重要性</h2>
+<p>Cluster 要求每个节点执行输入序列后得到 <strong>完全相同</strong> 的状态：</p>
+<table>
+<thead>
+<tr>
+<th>允许</th>
+<th>禁止</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>cluster.time()</code></td>
+<td><code>System.currentTimeMillis()</code></td>
+</tr>
+<tr>
+<td>事件驱动 timer（<code>cluster.scheduleTimer</code>）</td>
+<td><code>ScheduledExecutorService</code></td>
+</tr>
+<tr>
+<td>请求里带的随机数</td>
+<td><code>Math.random()</code> / <code>SecureRandom</code></td>
+</tr>
+<tr>
+<td>请求里带的外部数据</td>
+<td>内部读文件、发 HTTP</td>
+</tr>
+</tbody>
+</table>
+<h2 id="2210-aeron-cookbook">22.10 读 aeron-cookbook</h2>
+<p><code>aeron-cookbook-code</code> 里的 <code>cluster</code> 章节最完整，包含：
+- 基础 cluster
+- cluster + SBE 协议
+- cluster + protocol-buffers
+- Kotlin cluster</p>
+<p>学到这里，去克隆下来跑一下：</p>
+<div class="codehilite"><pre><span></span><code>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/aeron-io/aeron-cookbook-code.git
+<span class="nb">cd</span><span class="w"> </span>aeron-cookbook-code/aeron-cluster/simple-cluster
+./gradlew<span class="w"> </span>run
+</code></pre></div>
+
+<h2 id="2211">22.11 小结</h2>
+<ul>
+<li>ClusteredService = 你的业务对象；Cluster 帮你 Raft</li>
+<li>Client 用 AeronCluster 与 leader 通信，自动切换</li>
+<li>关键约束：<strong>onSessionMessage 必须确定性</strong></li>
+<li>Snapshot 让 log 不无限增长</li>
+</ul>
+<nav class="chapter-nav"><a href="ch21-cluster-overview.html" class="nav-link">← 第 21 章 · Aeron Cluster：概述与 Raft</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch23-deploy-tuning.html" class="nav-link next">第 23 章 · 部署、监控、性能调优 →</a></nav>
+</article>
+<script>
+  // 高亮所有非 mermaid 代码块
+  document.querySelectorAll('pre code:not(.language-mermaid)').forEach(el => {
+    if (window.hljs) hljs.highlightElement(el);
+  });
+</script>
+</body>
+</html>

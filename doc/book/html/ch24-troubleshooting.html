@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 24 章 · 常见错误与排错手册</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-light.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/index.min.js"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose" });
+</script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+                 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2em 1em 4em;
+    background: #fafafa;
+    color: #24292f;
+  }
+  .markdown-body {
+    background: #ffffff;
+    padding: 2.5em 3em;
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+  }
+  .markdown-body pre {
+    background: #f6f8fa !important;
+  }
+  .markdown-body pre.mermaid {
+    background: transparent !important;
+    text-align: center;
+    padding: 1em;
+  }
+  nav.chapter-nav {
+    display: flex;
+    justify-content: space-between;
+    padding: 1em;
+    margin-bottom: 1.5em;
+    background: #eef2f7;
+    border-radius: 8px;
+    font-size: 0.95em;
+  }
+  nav.chapter-nav a {
+    color: #0969da;
+    text-decoration: none;
+  }
+  nav.chapter-nav a:hover { text-decoration: underline; }
+  nav.chapter-nav .nav-link { min-width: 30%; }
+  nav.chapter-nav .nav-link.next { text-align: right; }
+  nav.chapter-nav .nav-link.home { text-align: center; }
+</style>
+</head>
+<body>
+<article class="markdown-body">
+<nav class="chapter-nav"><a href="ch23-deploy-tuning.html" class="nav-link">← 第 23 章 · 部署、监控、性能调优</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch25-market-bus.html" class="nav-link next">第 25 章 · 综合案例：低延迟行情总线 →</a></nav>
+<h1 id="24">第 24 章 · 常见错误与排错手册</h1>
+<p>按现象归类，每条给出诊断步骤和常见修复。</p>
+<h2 id="_1">本章速览：排错决策树</h2>
+<pre class="mermaid">
+flowchart TD
+    START([出问题了]) --> Q1{何时发生?}
+    Q1 -->|启动时| S1[24.1 启动类<br/>ActiveDriverException<br/>连不上 driver<br/>isConnected 卡住]
+    Q1 -->|offer 时| S2[24.2 offer 类<br/>NOT_CONNECTED<br/>BACK_PRESSURED<br/>CLOSED]
+    Q1 -->|收不到 or 丢包| S3[24.3 UDP 类<br/>loss report 增长<br/>多网卡问题<br/>组播不通]
+    Q1 -->|运行时慢| S4[24.4 内存/性能类<br/>CPU 100%<br/>GC pause<br/>term buffer 大]
+    Q1 -->|Cluster 相关| S5[24.5 Cluster 类<br/>选不出 leader<br/>state 分叉<br/>Follower 追不上]
+    Q1 -->|Archive 相关| S6[24.6 Archive 类<br/>启动失败<br/>磁盘满<br/>replay 慢]
+
+    style S1 fill:#fdffb6
+    style S2 fill:#ffd6a5
+    style S3 fill:#a0c4ff
+    style S4 fill:#caffbf
+    style S5 fill:#fef3c7
+    style S6 fill:#fde8e8
+</pre>
+
+<p><strong>排错心法</strong>：先看 counter（<code>AeronStat</code>）→ 再看 driver 日志 → 最后看业务代码。别一上来 review 业务代码。</p>
+<h2 id="241">24.1 启动类</h2>
+<h3 id="2411-activedriverexception">24.1.1 <code>ActiveDriverException</code></h3>
+<p><strong>现象</strong>：<code>java.io.IOException: ActiveDriverException: driver active</code>。</p>
+<p><strong>原因</strong>：同一目录已经有 driver 在跑，或者上次没关干净留下的 pidfile。</p>
+<p><strong>修复</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1) 确认没有别的 driver 进程</span>
+ps<span class="w"> </span>aux<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-i<span class="w"> </span>mediadriver
+
+<span class="c1"># 2) 删掉残留目录</span>
+rm<span class="w"> </span>-rf<span class="w"> </span>/tmp/aeron-<span class="nv">$USER</span>
+
+<span class="c1"># 3) 或用 launchEmbedded() 生成新目录</span>
+<span class="c1"># 4) Context 里加 .dirDeleteOnStart(true)</span>
+</code></pre></div>
+
+<h3 id="2412-aeronexception-aeron-client-is-closed">24.1.2 <code>AeronException: Aeron client is closed</code></h3>
+<p><strong>原因</strong>：Aeron client 已经 <code>close()</code>，还在用 pub/sub 引用。</p>
+<p><strong>修复</strong>：检查生命周期。try-with-resources 是最简单的方式，也可以给 Aeron.Context 设 <code>errorHandler</code> 排查。</p>
+<h3 id="2413-publicationisconnected">24.1.3 一直卡在 <code>!publication.isConnected()</code></h3>
+<p><strong>原因</strong>：
+1. Publisher 与 Subscription 的 (channel, streamId) 不完全一致（比如 URI 多了一个空格）；
+2. Publisher 与 Subscription 连的不是同一个 driver（aeronDirectoryName 不匹配）；
+3. UDP 端口被防火墙拦；
+4. UDP endpoint 在 subscriber 端没绑对 IP。</p>
+<p><strong>排查</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">System</span><span class="p">.</span><span class="na">out</span><span class="p">.</span><span class="na">println</span><span class="p">(</span><span class="n">pub</span><span class="p">.</span><span class="na">channel</span><span class="p">()</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="s">&quot; &quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">pub</span><span class="p">.</span><span class="na">streamId</span><span class="p">());</span>
+<span class="n">System</span><span class="p">.</span><span class="na">out</span><span class="p">.</span><span class="na">println</span><span class="p">(</span><span class="n">sub</span><span class="p">.</span><span class="na">channel</span><span class="p">()</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="s">&quot; &quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">sub</span><span class="p">.</span><span class="na">streamId</span><span class="p">());</span>
+</code></pre></div>
+
+<p>两个 print 出来必须完全一致（连引号里空格都要）。</p>
+<h2 id="242-offer">24.2 offer 类</h2>
+<h3 id="2421-not_connected-1">24.2.1 一直 NOT_CONNECTED (-1)</h3>
+<p><strong>原因</strong>：Subscriber 还没上线；或 UDP 的 SM 没到。</p>
+<p><strong>修复</strong>：先 sleep 等 <code>isConnected()</code> 变 true 再 offer；或者容忍前几秒的失败。</p>
+<h3 id="2422-back_pressured-2">24.2.2 频繁 BACK_PRESSURED (-2)</h3>
+<p><strong>原因</strong>：消费者跟不上。</p>
+<p><strong>排查顺序</strong>：
+1. Handler 里做了慢操作（sleep、log、锁）？→ 立刻修。
+2. term-length 太小 → 加大到 16MB / 32MB。
+3. 消费者 IdleStrategy 太懒（SleepingIdleStrategy(10ms)）？→ 换 BackoffIdleStrategy。
+4. UDP 场景 SM 太慢？→ <code>ctx.statusMessageTimeoutNs(...)</code> 调短。</p>
+<h3 id="2423-closed-4">24.2.3 CLOSED (-4)</h3>
+<p><strong>原因</strong>：Publication 已 close。<strong>修复</strong>：检查代码，别在关闭后继续 offer。</p>
+<h3 id="2424-max_position_exceeded-5">24.2.4 MAX_POSITION_EXCEEDED (-5)</h3>
+<p><strong>原因</strong>：Publisher 的 stream 位置耗尽（<code>2^63 / term_length</code>）。</p>
+<p><strong>修复</strong>：新建 Publication；重启进程。生产环境不太可能遇到（term_length=16M 时能撑 500 亿年）。</p>
+<h2 id="243-udp">24.3 UDP 类</h2>
+<h3 id="2431-loss-report">24.3.1 部分包丢失（loss report 增长）</h3>
+<p><strong>原因</strong>：网络丢包 or 消费者太慢导致 term 覆盖。</p>
+<p><strong>修复</strong>：
+- 加大 term-length（NAK 窗口更大）
+- 增加 socket buffer（<code>so_rcvbuf</code>）
+- 检查 MTU 是否两端一致</p>
+<h3 id="2432-subscriber">24.3.2 多网卡时 subscriber 收不到</h3>
+<p><strong>修复</strong>：URI 里显式指定 <code>interface=&lt;local-ip&gt;</code>。</p>
+<h3 id="2433">24.3.3 组播不通</h3>
+<p><strong>排查</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 加入组的网卡对不对</span>
+netstat<span class="w"> </span>-g
+
+<span class="c1"># 交换机 IGMP snooping 是否放行</span>
+tcpdump<span class="w"> </span>-i<span class="w"> </span>eth0<span class="w"> </span>-n<span class="w"> </span>dst<span class="w"> </span><span class="m">239</span>.x.y.z
+</code></pre></div>
+
+<h2 id="244">24.4 内存 / 性能类</h2>
+<h3 id="2441-term-buffer">24.4.1 term buffer 文件很大</h3>
+<p><strong>原因</strong>：每个 Publication.log 是 3 × term-length。默认 term=16 MB → 48 MB / publication。</p>
+<p><strong>修复</strong>：改用 <code>.ipcPublicationTermBufferLength(4 MB)</code>，或减少 publisher 数量。</p>
+<h3 id="2442-driver-cpu-100">24.4.2 driver CPU 100%</h3>
+<p><strong>原因</strong>：ThreadingMode=DEDICATED + NoOpIdleStrategy，绑核了没？没绑核就是抢别人 CPU。</p>
+<p><strong>修复</strong>：<code>taskset -c N,N+1,N+2 java ...</code>。</p>
+<h3 id="2443-gc-pause-p99">24.4.3 GC pause 拖高 P99</h3>
+<p><strong>原因</strong>：业务代码有分配、log 不 gc-free、Assembler 扩容...</p>
+<p><strong>修复</strong>：
+- ZGC / Shenandoah；
+- log4j2 async layout + gc-free pattern；
+- 排查 UnsafeBuffer 使用是否复用。</p>
+<h2 id="245-cluster">24.5 Cluster 类</h2>
+<h3 id="2451-leader">24.5.1 节点选不出 leader</h3>
+<p><strong>原因</strong>：
+- clusterMembers 端口写错，节点间通信不通；
+- 时钟严重不同步。</p>
+<p><strong>排查</strong>：<code>journalctl -u aeron-cluster</code> 看 role 变化日志。</p>
+<h3 id="2452-follower">24.5.2 Follower 追赶不上</h3>
+<p><strong>原因</strong>：磁盘 replay 太慢，或 log 太长又没 snapshot。</p>
+<p><strong>修复</strong>：调低 snapshot 间隔；用更快 SSD；减少 snapshot 大小。</p>
+<h3 id="2453-service-state">24.5.3 Service state 分叉</h3>
+<p><strong>原因</strong>：Service 里用了非确定性 API（Random、currentTimeMillis）。</p>
+<p><strong>修复</strong>：全部换成 <code>cluster.time()</code> / 请求里带随机数。</p>
+<h2 id="246-archive">24.6 Archive 类</h2>
+<h3 id="2461-startrecording-1">24.6.1 startRecording 返回 -1 或抛异常</h3>
+<p><strong>原因</strong>：controlChannel 没连上，或 stream 不存在。</p>
+<p><strong>修复</strong>：先确认 Archive 已启动、control channel 通。</p>
+<h3 id="2462">24.6.2 磁盘写满</h3>
+<p><strong>修复</strong>：<code>purgeRecording</code> 或迁移到冷存储。生产用 alert 提前警告。</p>
+<h3 id="2463-replay">24.6.3 Replay 特别慢</h3>
+<p><strong>原因</strong>：磁盘 IO 慢，或 replay stream MTU 小。</p>
+<p><strong>修复</strong>：SSD，或加大 replay channel 的 MTU。</p>
+<h2 id="247">24.7 通用调试技巧</h2>
+<ol>
+<li><strong>打开 debug log</strong>：<code>-Daeron.event.log=all -Daeron.event.log.output.filename=/tmp/aeron-events.log</code></li>
+<li><strong>AeronStat 实时看 counter</strong>（Ch15）</li>
+<li><strong>cnc 反解</strong>：<code>java -cp aeron-agent.jar io.aeron.agent.EventLogAgent ...</code></li>
+<li><strong><code>errorHandler</code></strong>：Aeron.Context / Archive.Context / ClusteredServiceContainer.Context 都可以设，务必打印 stacktrace。</li>
+</ol>
+<h2 id="248">24.8 排错心法</h2>
+<ul>
+<li><strong>先看 counter，再看 log</strong>：AeronStat 比日志更能反映真相；</li>
+<li><strong>减法调试</strong>：把 IdleStrategy 换成 SleepingIdle(1s) 也能收 → 说明业务不忙，问题在别处；</li>
+<li><strong>单机复现</strong>：先用 IPC 排除网络问题；</li>
+<li><strong>对齐版本</strong>：aeron-driver / aeron-client / aeron-archive 版本必须完全一致。</li>
+</ul>
+<h2 id="249">24.9 小结</h2>
+<ul>
+<li>排错先看 counter → 再看 log → 最后看代码</li>
+<li>大多数问题落在 (channel, streamId) 不匹配、term 太小、IdleStrategy 不当</li>
+<li>Cluster 独有的雷是 "非确定性 service"</li>
+</ul>
+<nav class="chapter-nav"><a href="ch23-deploy-tuning.html" class="nav-link">← 第 23 章 · 部署、监控、性能调优</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch25-market-bus.html" class="nav-link next">第 25 章 · 综合案例：低延迟行情总线 →</a></nav>
+</article>
+<script>
+  // 高亮所有非 mermaid 代码块
+  document.querySelectorAll('pre code:not(.language-mermaid)').forEach(el => {
+    if (window.hljs) hljs.highlightElement(el);
+  });
+</script>
+</body>
+</html>

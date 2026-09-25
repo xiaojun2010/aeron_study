@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 04 章 · MediaDriver：从嵌入式到独立部署</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-light.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/index.min.js"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose" });
+</script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+                 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2em 1em 4em;
+    background: #fafafa;
+    color: #24292f;
+  }
+  .markdown-body {
+    background: #ffffff;
+    padding: 2.5em 3em;
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+  }
+  .markdown-body pre {
+    background: #f6f8fa !important;
+  }
+  .markdown-body pre.mermaid {
+    background: transparent !important;
+    text-align: center;
+    padding: 1em;
+  }
+  nav.chapter-nav {
+    display: flex;
+    justify-content: space-between;
+    padding: 1em;
+    margin-bottom: 1.5em;
+    background: #eef2f7;
+    border-radius: 8px;
+    font-size: 0.95em;
+  }
+  nav.chapter-nav a {
+    color: #0969da;
+    text-decoration: none;
+  }
+  nav.chapter-nav a:hover { text-decoration: underline; }
+  nav.chapter-nav .nav-link { min-width: 30%; }
+  nav.chapter-nav .nav-link.next { text-align: right; }
+  nav.chapter-nav .nav-link.home { text-align: center; }
+</style>
+</head>
+<body>
+<article class="markdown-body">
+<nav class="chapter-nav"><a href="ch03-first-program.html" class="nav-link">← 第 03 章 · 环境准备与第一个可运行程序</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch05-publication.html" class="nav-link next">第 05 章 · Publication 全解 →</a></nav>
+<h1 id="04-mediadriver">第 04 章 · MediaDriver：从嵌入式到独立部署</h1>
+<h2 id="_1">学习目标</h2>
+<ul>
+<li>弄清楚 <code>launch()</code> vs <code>launchEmbedded()</code> 的差别；</li>
+<li>掌握 <code>ThreadingMode</code> 三种取值以及适用场景；</li>
+<li>学会调整 term buffer 大小、目录路径、超时时间；</li>
+<li>能独立部署 MediaDriver 给多个业务进程共用。</li>
+</ul>
+<h2 id="_2">本章速览</h2>
+<pre class="mermaid">
+flowchart TB
+    subgraph Embedded["方案 A：嵌入式（学习/测试）"]
+        JVM1[业务 JVM] --> D1[内嵌 driver 线程]
+        D1 --> SHM1[(共享内存<br/>随机目录)]
+    end
+    subgraph Standalone["方案 B：独立部署（生产）"]
+        DP[driver 进程<br/>systemd 管]
+        DP --> SHM2[(共享内存<br/>固定目录)]
+        JVM2[业务 JVM A] -->|Aeron.connect| SHM2
+        JVM3[业务 JVM B] -->|Aeron.connect| SHM2
+        JVM4[业务 JVM C] -->|Aeron.connect| SHM2
+    end
+    style Embedded fill:#e8f4fd
+    style Standalone fill:#fef3c7
+</pre>
+
+<h2 id="41-mediadriver">4.1 MediaDriver 是什么</h2>
+<p>Aeron 真正干活的进程 / 线程。它的核心职责：</p>
+<ol>
+<li>分配并管理共享内存文件（term buffer、cnc.dat、loss report）；</li>
+<li>处理 UDP sender/receiver：把 term buffer 里的数据发到网卡，反之收下来放到 image；</li>
+<li>Conductor 线程：负责与所有 Aeron Client 做 handshake、命令控制。</li>
+</ol>
+<p>一个 MediaDriver 内部通常有三种角色线程：</p>
+<div class="codehilite"><pre><span></span><code>┌────────────────────────────────────────┐
+│               MediaDriver              │
+│                                        │
+│   ┌──────────┐   ┌──────────┐          │
+│   │Conductor │   │  Sender  │          │
+│   │(命令+心跳)│   │(UDP send)│          │
+│   └──────────┘   └──────────┘          │
+│                  ┌──────────┐          │
+│                  │ Receiver │          │
+│                  │(UDP recv)│          │
+│                  └──────────┘          │
+└────────────────────────────────────────┘
+</code></pre></div>
+
+<p>不同的 <code>ThreadingMode</code> 决定这三种角色是"各占一个线程"还是"合成一个线程"。</p>
+<h2 id="42-launch-vs-launchembedded">4.2 launch() vs launchEmbedded()</h2>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>目录</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>MediaDriver.launch(ctx)</code></td>
+<td>使用 ctx 里的 <code>aeronDirectoryName</code>（默认 <code>${TMPDIR}/aeron-${user}</code>）</td>
+<td>独立进程部署；同机器只能有一个默认目录的实例</td>
+</tr>
+<tr>
+<td><code>MediaDriver.launchEmbedded(ctx)</code></td>
+<td>自动生成随机目录 <code>aeron-&lt;user&gt;-&lt;epoch&gt;-&lt;random&gt;</code></td>
+<td>内嵌 driver；同机器可并存多个</td>
+</tr>
+</tbody>
+</table>
+<div class="codehilite"><pre><span></span><code><span class="c1">// 独立部署：明确目录，所有客户端都连到这里</span>
+<span class="n">MediaDriver</span><span class="w"> </span><span class="n">driver</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">MediaDriver</span><span class="p">.</span><span class="na">launch</span><span class="p">(</span><span class="k">new</span><span class="w"> </span><span class="n">MediaDriver</span><span class="p">.</span><span class="na">Context</span><span class="p">()</span>
+<span class="w">    </span><span class="p">.</span><span class="na">aeronDirectoryName</span><span class="p">(</span><span class="s">&quot;/dev/shm/aeron/prod-driver&quot;</span><span class="p">));</span>
+
+<span class="c1">// 嵌入式：适合 demo、集成测试、单进程 all-in-one</span>
+<span class="n">MediaDriver</span><span class="w"> </span><span class="n">driver</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">MediaDriver</span><span class="p">.</span><span class="na">launchEmbedded</span><span class="p">();</span>
+</code></pre></div>
+
+<h2 id="43-threadingmode">4.3 ThreadingMode 三种</h2>
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th>线程数</th>
+<th>适用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>DEDICATED</code></td>
+<td>3（Conductor + Sender + Receiver 各一）</td>
+<td>高性能生产、每个线程绑核</td>
+</tr>
+<tr>
+<td><code>SHARED_NETWORK</code></td>
+<td>2（Conductor 一个，Sender+Receiver 合一）</td>
+<td>中等负载</td>
+</tr>
+<tr>
+<td><code>SHARED</code></td>
+<td>1（三合一）</td>
+<td>学习 / 低负载 / CPU 紧张</td>
+</tr>
+<tr>
+<td><code>INVOKER</code></td>
+<td>0（不启 driver 线程，业务代码手动调 <code>invoke()</code>）</td>
+<td>单线程模型，用于内嵌到 Netty EventLoop 等</td>
+</tr>
+</tbody>
+</table>
+<p><strong>线程模型可视化</strong>：</p>
+<pre class="mermaid">
+flowchart LR
+    subgraph DEDICATED["DEDICATED（生产标配）"]
+        direction TB
+        C1[Conductor 线程]
+        S1[Sender 线程]
+        R1[Receiver 线程]
+    end
+    subgraph SHARED_NETWORK["SHARED_NETWORK（中等）"]
+        direction TB
+        C2[Conductor 线程]
+        SR2["Sender+Receiver<br/>合线程"]
+    end
+    subgraph SHARED["SHARED（demo/低负载）"]
+        direction TB
+        ALL["Conductor+Sender+Receiver<br/>全部一个线程"]
+    end
+    style DEDICATED fill:#caffbf
+    style SHARED_NETWORK fill:#fdffb6
+    style SHARED fill:#ffd6a5
+</pre>
+
+<p>配置示例：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">MediaDriver</span><span class="p">.</span><span class="na">Context</span><span class="w"> </span><span class="n">ctx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">MediaDriver</span><span class="p">.</span><span class="na">Context</span><span class="p">()</span>
+<span class="w">    </span><span class="p">.</span><span class="na">threadingMode</span><span class="p">(</span><span class="n">ThreadingMode</span><span class="p">.</span><span class="na">DEDICATED</span><span class="p">)</span>
+<span class="w">    </span><span class="p">.</span><span class="na">conductorIdleStrategy</span><span class="p">(</span><span class="k">new</span><span class="w"> </span><span class="n">BackoffIdleStrategy</span><span class="p">(...))</span>
+<span class="w">    </span><span class="p">.</span><span class="na">senderIdleStrategy</span><span class="p">(</span><span class="k">new</span><span class="w"> </span><span class="n">NoOpIdleStrategy</span><span class="p">())</span><span class="w">    </span><span class="c1">// 极致低延迟：sender 忙等</span>
+<span class="w">    </span><span class="p">.</span><span class="na">receiverIdleStrategy</span><span class="p">(</span><span class="k">new</span><span class="w"> </span><span class="n">NoOpIdleStrategy</span><span class="p">());</span>
+</code></pre></div>
+
+<p>绑核可以在启动时用 <code>taskset</code>（Linux）或 JVM 层面 <code>Thread.setName()</code> + 外部工具完成。</p>
+<h2 id="44-context">4.4 关键 Context 参数</h2>
+<h3 id="441-aerondirectoryname">4.4.1 <code>aeronDirectoryName</code></h3>
+<ul>
+<li>默认：<code>${TMPDIR}/aeron-${user}</code></li>
+<li>建议：生产设为 tmpfs（<code>/dev/shm/aeron-xxx</code>），避免磁盘 IO 干扰</li>
+<li>必须让 driver 与所有客户端一致</li>
+</ul>
+<h3 id="442-dirdeleteonstart-dirdeleteonshutdown">4.4.2 <code>dirDeleteOnStart</code> / <code>dirDeleteOnShutdown</code></h3>
+<div class="codehilite"><pre><span></span><code><span class="n">ctx</span><span class="p">.</span><span class="na">dirDeleteOnStart</span><span class="p">(</span><span class="kc">true</span><span class="p">).</span><span class="na">dirDeleteOnShutdown</span><span class="p">(</span><span class="kc">true</span><span class="p">);</span>
+</code></pre></div>
+
+<p>开发时打开可以避免"上次没关干净"导致 <code>ActiveDriverException</code>。
+生产建议 <strong>关闭 dirDeleteOnShutdown</strong>，方便崩溃后取证。</p>
+<h3 id="443-termbuffersparsefile">4.4.3 <code>termBufferSparseFile</code></h3>
+<ul>
+<li>true（默认）：稀疏文件，只在需要时物理占用磁盘；对开发友好</li>
+<li>false：预分配，第一次写入无缺页 fault；生产建议 false，前提是 tmpfs 空间够</li>
+</ul>
+<h3 id="444-term-buffer">4.4.4 Term Buffer 大小</h3>
+<p>Aeron 的每个 Publication 都有 3 个 term buffer（三段循环）：</p>
+<pre class="mermaid">
+flowchart LR
+    P[Publisher] -->|写入| T0["term[0]<br/>16 MB"]
+    T0 -.->|写满切换| T1["term[1]<br/>16 MB"]
+    T1 -.->|写满切换| T2["term[2]<br/>16 MB"]
+    T2 -.->|回到 0| T0
+    C[Subscriber<br/>consumer position] --> T0
+    C -.-> T1
+    C -.-> T2
+    style T0 fill:#caffbf
+    style T1 fill:#fdffb6
+    style T2 fill:#ffd6a5
+</pre>
+
+<p><strong>记忆</strong>：三个 term 循环，就像三个跑道轮流用；某个跑道消费者还没走完，Publisher 就得停下（BackPressure）。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">ctx</span><span class="p">.</span><span class="na">publicationTermBufferLength</span><span class="p">(</span><span class="mi">1</span><span class="w"> </span><span class="o">&lt;&lt;</span><span class="w"> </span><span class="mi">24</span><span class="p">);</span><span class="w">         </span><span class="c1">// 16 MB × 3 = 48 MB</span>
+<span class="n">ctx</span><span class="p">.</span><span class="na">ipcPublicationTermBufferLength</span><span class="p">(</span><span class="mi">1</span><span class="w"> </span><span class="o">&lt;&lt;</span><span class="w"> </span><span class="mi">22</span><span class="p">);</span><span class="w">      </span><span class="c1">// IPC 用小一点：4 MB × 3</span>
+</code></pre></div>
+
+<ul>
+<li>太小：BackPressure 触发太快（Ch08）</li>
+<li>太大：内存浪费、初始化慢</li>
+<li>必须是 2 的幂，最大 1 GB</li>
+</ul>
+<h3 id="445">4.4.5 超时</h3>
+<div class="codehilite"><pre><span></span><code><span class="n">ctx</span><span class="p">.</span><span class="na">clientLivenessTimeoutNs</span><span class="p">(</span><span class="n">TimeUnit</span><span class="p">.</span><span class="na">SECONDS</span><span class="p">.</span><span class="na">toNanos</span><span class="p">(</span><span class="mi">10</span><span class="p">));</span><span class="w">     </span><span class="c1">// client 被认为死掉的时间</span>
+<span class="n">ctx</span><span class="p">.</span><span class="na">imageLivenessTimeoutNs</span><span class="p">(</span><span class="n">TimeUnit</span><span class="p">.</span><span class="na">SECONDS</span><span class="p">.</span><span class="na">toNanos</span><span class="p">(</span><span class="mi">10</span><span class="p">));</span><span class="w">      </span><span class="c1">// Image 存活时间</span>
+<span class="n">ctx</span><span class="p">.</span><span class="na">publicationUnblockTimeoutNs</span><span class="p">(</span><span class="n">TimeUnit</span><span class="p">.</span><span class="na">SECONDS</span><span class="p">.</span><span class="na">toNanos</span><span class="p">(</span><span class="mi">15</span><span class="p">));</span><span class="w"> </span><span class="c1">// Publisher 卡住多久算死</span>
+</code></pre></div>
+
+<p>高频交易场景通常调短，方便快速切换到备份路径。</p>
+<h2 id="45">4.5 独立部署示例</h2>
+<p>我们的配套代码 demo03 就是独立部署的三个进程：</p>
+<div class="codehilite"><pre><span></span><code>Demo03aStandaloneMediaDriver  ─┐
+                               │  共享 /var/folders/.../aeron-zxj
+Demo03bSubscriberProcess  ─────┤
+                               │
+Demo03cPublisherProcess  ──────┘
+</code></pre></div>
+
+<p>生产上，还会再加一层：把 driver 打成 fat jar 或 native image，systemd 管理：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># /etc/systemd/system/aeron-driver.service</span>
+<span class="k">[Service]</span>
+<span class="na">Type</span><span class="o">=</span><span class="s">simple</span>
+<span class="na">User</span><span class="o">=</span><span class="s">aeron</span>
+<span class="na">ExecStart</span><span class="o">=</span><span class="s">/usr/bin/java -XX:+AlwaysPreTouch -Xms1g -Xmx1g </span>\
+<span class="w">    </span><span class="s">-jar /opt/aeron/aeron-driver.jar </span>\
+<span class="w">    </span><span class="s">--aeron.dir=/dev/shm/aeron-prod</span>
+<span class="na">Restart</span><span class="o">=</span><span class="s">always</span>
+<span class="na">LimitNOFILE</span><span class="o">=</span><span class="s">100000</span>
+<span class="na">LimitMEMLOCK</span><span class="o">=</span><span class="s">infinity</span>
+</code></pre></div>
+
+<h2 id="46-context">4.6 Context 的常用调优矩阵</h2>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>ThreadingMode</th>
+<th>目录</th>
+<th>Term Size</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>本地 demo</td>
+<td>SHARED</td>
+<td>tmp</td>
+<td>默认</td>
+<td>简单</td>
+</tr>
+<tr>
+<td>集成测试</td>
+<td>SHARED_NETWORK</td>
+<td>tmpfs</td>
+<td>4 MB</td>
+<td>快启动</td>
+</tr>
+<tr>
+<td>内部 IPC 生产</td>
+<td>SHARED_NETWORK</td>
+<td>tmpfs</td>
+<td>16 MB</td>
+<td>IPC 不需要 sender/receiver 拆分</td>
+</tr>
+<tr>
+<td>跨机 UDP 生产</td>
+<td>DEDICATED</td>
+<td>tmpfs</td>
+<td>32 MB</td>
+<td>三线程绑核</td>
+</tr>
+<tr>
+<td>高频行情</td>
+<td>DEDICATED + NoOp idle + 绑核</td>
+<td>tmpfs + 大 term</td>
+<td>64 MB</td>
+<td>争取每一微秒</td>
+</tr>
+</tbody>
+</table>
+<h2 id="47">4.7 常见坑</h2>
+<ol>
+<li><strong>两次 <code>launch()</code> 起在同一台机器</strong>：报 <code>ActiveDriverException</code>。用 <code>launchEmbedded()</code> 或换目录。</li>
+<li><strong>忘记设 <code>aeronDirectoryName</code></strong>：内嵌 driver 每次目录随机，客户端连接的目录不对。</li>
+<li><strong>停机残留目录</strong>：<code>ls /dev/shm | grep aeron</code> 手工清理，或用 <code>dirDeleteOnStart(true)</code>。</li>
+<li><strong>term buffer 太小导致高频 BackPressure</strong>：加大或换 <code>ExclusivePublication</code>。</li>
+<li><strong><code>INVOKER</code> 模式忘调 <code>driverAgentInvoker.invoke()</code></strong>：一切静止，什么消息都没有。</li>
+</ol>
+<h2 id="48">4.8 下一步</h2>
+<p>MediaDriver 就位后，客户端就要用 <code>Publication</code> / <code>Subscription</code> 收发。第 05 章我们把 Publication 拆开讲：exclusive vs concurrent、position、可靠性、生命周期。</p>
+<nav class="chapter-nav"><a href="ch03-first-program.html" class="nav-link">← 第 03 章 · 环境准备与第一个可运行程序</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch05-publication.html" class="nav-link next">第 05 章 · Publication 全解 →</a></nav>
+</article>
+<script>
+  // 高亮所有非 mermaid 代码块
+  document.querySelectorAll('pre code:not(.language-mermaid)').forEach(el => {
+    if (window.hljs) hljs.highlightElement(el);
+  });
+</script>
+</body>
+</html>

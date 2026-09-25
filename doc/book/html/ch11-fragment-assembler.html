@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 11 章 · 大消息与 FragmentAssembler</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-light.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/index.min.js"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose" });
+</script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+                 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2em 1em 4em;
+    background: #fafafa;
+    color: #24292f;
+  }
+  .markdown-body {
+    background: #ffffff;
+    padding: 2.5em 3em;
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+  }
+  .markdown-body pre {
+    background: #f6f8fa !important;
+  }
+  .markdown-body pre.mermaid {
+    background: transparent !important;
+    text-align: center;
+    padding: 1em;
+  }
+  nav.chapter-nav {
+    display: flex;
+    justify-content: space-between;
+    padding: 1em;
+    margin-bottom: 1.5em;
+    background: #eef2f7;
+    border-radius: 8px;
+    font-size: 0.95em;
+  }
+  nav.chapter-nav a {
+    color: #0969da;
+    text-decoration: none;
+  }
+  nav.chapter-nav a:hover { text-decoration: underline; }
+  nav.chapter-nav .nav-link { min-width: 30%; }
+  nav.chapter-nav .nav-link.next { text-align: right; }
+  nav.chapter-nav .nav-link.home { text-align: center; }
+</style>
+</head>
+<body>
+<article class="markdown-body">
+<nav class="chapter-nav"><a href="ch10-agrona-buffer.html" class="nav-link">← 第 10 章 · Agrona DirectBuffer 与零 GC 编程</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch12-sbe.html" class="nav-link next">第 12 章 · Simple Binary Encoding（SBE） →</a></nav>
+<h1 id="11-fragmentassembler">第 11 章 · 大消息与 FragmentAssembler</h1>
+<h2 id="_1">学习目标</h2>
+<ul>
+<li>理解 MTU、term-length、消息大小三者的关系；</li>
+<li>会用 FragmentAssembler / ControlledFragmentAssembler 拼装大消息；</li>
+<li>明白 <code>BEGIN</code> / <code>END</code> fragment flag 的机制；</li>
+<li>知道大消息在低延迟系统里的成本，学会规避。</li>
+</ul>
+<h2 id="3-kb-mtu1408">本章速览：3 KB 消息在 MTU=1408 下的路径</h2>
+<pre class="mermaid">
+flowchart LR
+    subgraph P["Publisher offer 3KB"]
+        MSG[整条消息 3072 字节]
+    end
+    subgraph AERON[MediaDriver 自动拆片]
+        F1["Fragment 1<br/>1408 B<br/>flag=BEGIN"]
+        F2["Fragment 2<br/>1408 B<br/>flag=中间"]
+        F3["Fragment 3<br/>256 B<br/>flag=END"]
+    end
+    subgraph S["Subscriber 用 FragmentAssembler"]
+        BUF[重组 buffer]
+        FULL[完整消息 3072 字节]
+    end
+    MSG --> F1 & F2 & F3
+    F1 -->|存入| BUF
+    F2 -->|追加| BUF
+    F3 -->|追加+触发回调| FULL
+    style FULL fill:#caffbf
+</pre>
+
+<p><strong>关键</strong>：Publisher 不感知拆片；只要 Subscriber 用了 <code>FragmentAssembler</code> 包装，业务 handler 收到的就是完整消息。</p>
+<h2 id="111">11.1 拆包的两条边界</h2>
+<p>Aeron 会在两种情况把消息拆开：</p>
+<ol>
+<li><strong>超过 MTU</strong>：单个 UDP 包大小限制，默认 1408 字节；</li>
+<li><strong>term buffer 满</strong>：term 剩余空间不足以放当前消息。</li>
+</ol>
+<p>对第一种，driver 会把消息切成多个"fragment"，每个 fragment 都是独立的 Aeron message frame。
+对第二种，Aeron 会 padding 剩余空间 + 到下一个 term（这不算拆包，业务不感知）。</p>
+<h2 id="112-fragment-flag">11.2 fragment 的 flag</h2>
+<p>Aeron header 里两个 bit 表示这个 fragment 在消息中的位置：</p>
+<table>
+<thead>
+<tr>
+<th>flag</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>BEGIN_FRAG_FLAG = 0x80</code></td>
+<td>消息的第一片</td>
+</tr>
+<tr>
+<td><code>END_FRAG_FLAG = 0x40</code></td>
+<td>消息的最后一片</td>
+</tr>
+<tr>
+<td><code>UNFRAGMENTED = 0xC0</code></td>
+<td>完整消息（BEGIN + END 同时置位）</td>
+</tr>
+</tbody>
+</table>
+<p><strong>flag 位可视化</strong>：</p>
+<div class="codehilite"><pre><span></span><code>       bit7  bit6
+        │     │
+     ┌──▼──┬──▼──┬─────────────┐
+     │BEGIN│ END │ 其他位保留   │
+     └─────┴─────┴─────────────┘
+        1     1   = 0xC0  完整消息（未拆）
+        1     0   = 0x80  第一片
+        0     0   = 0x00  中间片
+        0     1   = 0x40  最后一片
+</code></pre></div>
+
+<p>在 <code>FragmentHandler</code> 里你可以自己判：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">FragmentHandler</span><span class="w"> </span><span class="n">h</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">buf</span><span class="p">,</span><span class="w"> </span><span class="n">offset</span><span class="p">,</span><span class="w"> </span><span class="n">length</span><span class="p">,</span><span class="w"> </span><span class="n">header</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">byte</span><span class="w"> </span><span class="n">flags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">header</span><span class="p">.</span><span class="na">flags</span><span class="p">();</span>
+<span class="w">    </span><span class="kt">boolean</span><span class="w"> </span><span class="n">begin</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">flags</span><span class="w"> </span><span class="o">&amp;</span><span class="w"> </span><span class="mh">0x80</span><span class="p">)</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">boolean</span><span class="w"> </span><span class="n">end</span><span class="w">   </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">flags</span><span class="w"> </span><span class="o">&amp;</span><span class="w"> </span><span class="mh">0x40</span><span class="p">)</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="c1">// ...</span>
+<span class="p">};</span>
+</code></pre></div>
+
+<p>但一般不这么手写，用 FragmentAssembler。</p>
+<h2 id="113-fragmentassembler">11.3 FragmentAssembler</h2>
+<div class="codehilite"><pre><span></span><code><span class="n">FragmentHandler</span><span class="w"> </span><span class="n">business</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">buf</span><span class="p">,</span><span class="w"> </span><span class="n">offset</span><span class="p">,</span><span class="w"> </span><span class="n">length</span><span class="p">,</span><span class="w"> </span><span class="n">header</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 这里的 length 是&quot;完整消息&quot;长度</span>
+<span class="p">};</span>
+
+<span class="c1">// 用 assembler 包一层</span>
+<span class="n">FragmentHandler</span><span class="w"> </span><span class="n">assembler</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">FragmentAssembler</span><span class="p">(</span><span class="n">business</span><span class="p">);</span>
+<span class="n">subscription</span><span class="p">.</span><span class="na">poll</span><span class="p">(</span><span class="n">assembler</span><span class="p">,</span><span class="w"> </span><span class="mi">10</span><span class="p">);</span>
+</code></pre></div>
+
+<p>内部行为：
+- 看到 <code>BEGIN</code> 但没 <code>END</code>：把 fragment 拷到 session-specific 的重组 buffer；
+- 看到中间片：继续追加；
+- 看到 <code>END</code>：一次性回调 business；
+- 每个 sessionId 各有一份重组 buffer，互不干扰；
+- 默认初始容量 4 KB，超过会 realloc（在慢路径）。</p>
+<h2 id="114-controlledfragmentassembler">11.4 ControlledFragmentAssembler</h2>
+<p>对应 <code>controlledPoll</code>：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">ControlledFragmentHandler</span><span class="w"> </span><span class="n">business</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">buf</span><span class="p">,</span><span class="w"> </span><span class="n">offset</span><span class="p">,</span><span class="w"> </span><span class="n">length</span><span class="p">,</span><span class="w"> </span><span class="n">header</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">backlog</span><span class="p">.</span><span class="na">isFull</span><span class="p">())</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="n">Action</span><span class="p">.</span><span class="na">ABORT</span><span class="p">;</span>
+<span class="w">    </span><span class="n">backlog</span><span class="p">.</span><span class="na">enqueue</span><span class="p">(</span><span class="n">buf</span><span class="p">,</span><span class="w"> </span><span class="n">offset</span><span class="p">,</span><span class="w"> </span><span class="n">length</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">Action</span><span class="p">.</span><span class="na">CONTINUE</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="n">ControlledFragmentHandler</span><span class="w"> </span><span class="n">wrapped</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">ControlledFragmentAssembler</span><span class="p">(</span><span class="n">business</span><span class="p">);</span>
+<span class="n">subscription</span><span class="p">.</span><span class="na">controlledPoll</span><span class="p">(</span><span class="n">wrapped</span><span class="p">,</span><span class="w"> </span><span class="mi">10</span><span class="p">);</span>
+</code></pre></div>
+
+<p>Action 语义与 Ch06 一致。</p>
+<h2 id="115">11.5 大消息在低延迟系统的成本</h2>
+<p>发送 8 KB 消息 vs 8 × 1 KB 消息，成本分布不同：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>8 KB 单条</th>
+<th>8 × 1 KB</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Publisher 侧序列化</td>
+<td>1 次</td>
+<td>8 次</td>
+</tr>
+<tr>
+<td>Aeron 拆片</td>
+<td>6 次 (MTU=1408)</td>
+<td>0 次</td>
+</tr>
+<tr>
+<td>UDP send</td>
+<td>6 次</td>
+<td>8 次</td>
+</tr>
+<tr>
+<td>Subscriber 侧重组</td>
+<td>6 次 + 一次 memcpy</td>
+<td>0 次</td>
+</tr>
+<tr>
+<td>Handler 回调</td>
+<td>1 次</td>
+<td>8 次</td>
+</tr>
+</tbody>
+</table>
+<p>结论：
+- 小消息 (&lt;MTU)：单条更快；
+- 大消息：可以考虑 tryClaim + SBE，尽量减少 assemble 拷贝；
+- 极端场景：把大消息拆成业务分片，让 handler 增量处理，避免拼装。</p>
+<h2 id="116-mtu">11.6 增大 MTU</h2>
+<p>如果你的网络支持 jumbo frame（9000 字节），可以：</p>
+<div class="codehilite"><pre><span></span><code>aeron:udp?endpoint=host:port|mtu=8192
+</code></pre></div>
+
+<p>driver 侧全局默认可以在 Context 设：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">ctx</span><span class="p">.</span><span class="na">mtuLength</span><span class="p">(</span><span class="mi">8192</span><span class="p">);</span>
+</code></pre></div>
+
+<p>⚠️ <strong>两端 MTU 必须一致</strong>，否则重传风暴。且需要网卡、交换机、防火墙都支持。</p>
+<h2 id="117">11.7 一段可运行示例</h2>
+<p>见 <code>aeron/src/main/java/org/example/demo07/Demo07FragmentAssembler.java</code>。核心结构：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">FragmentHandler</span><span class="w"> </span><span class="n">biz</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">buf</span><span class="p">,</span><span class="w"> </span><span class="n">offset</span><span class="p">,</span><span class="w"> </span><span class="n">length</span><span class="p">,</span><span class="w"> </span><span class="n">header</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">log</span><span class="p">.</span><span class="na">info</span><span class="p">(</span><span class="s">&quot;[Assembled] len={}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">length</span><span class="p">);</span><span class="w">   </span><span class="c1">// 每条完整消息一次</span>
+<span class="p">};</span>
+<span class="n">FragmentHandler</span><span class="w"> </span><span class="n">asm</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">FragmentAssembler</span><span class="p">(</span><span class="n">biz</span><span class="p">);</span>
+
+<span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="n">running</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">subscription</span><span class="p">.</span><span class="na">poll</span><span class="p">(</span><span class="n">asm</span><span class="p">,</span><span class="w"> </span><span class="mi">20</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>发送端故意发大小 100 ~ 4096 字节的消息，log 里能看到 raw fragment 数 &gt; 消息数。</p>
+<h2 id="118">11.8 常见陷阱</h2>
+<ol>
+<li><strong>忘记用 assembler</strong>：只要一条消息超过 MTU 就会漏字节。业务上"发一直没超过 MTU"的假设是脆弱的——加上就好。</li>
+<li><strong>assembler 与 handler 状态混用</strong>：Fragment 拼装时 handler 只在 END 才被调用；不要在中间 fragment 假设"我已经拿到完整消息"。</li>
+<li><strong>不同订阅 handler 共用一个 FragmentAssembler</strong>：assembler 内部按 sessionId 分表，同一个实例可以，但两个不同 Subscription 不能共用同一 assembler 实例。</li>
+<li><strong>忘记 assembler 初始大小</strong>：默认 4 KB，如果你的消息普遍 10 KB，可以给 ctor 传 initialBufferLength 避免早期扩容。</li>
+</ol>
+<h2 id="119">11.9 小结</h2>
+<ul>
+<li>MTU &gt; term rotation ≠ 消息拆分</li>
+<li>FragmentAssembler 把拆包变透明</li>
+<li>大消息代价高，能拆业务就拆业务</li>
+</ul>
+<nav class="chapter-nav"><a href="ch10-agrona-buffer.html" class="nav-link">← 第 10 章 · Agrona DirectBuffer 与零 GC 编程</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch12-sbe.html" class="nav-link next">第 12 章 · Simple Binary Encoding（SBE） →</a></nav>
+</article>
+<script>
+  // 高亮所有非 mermaid 代码块
+  document.querySelectorAll('pre code:not(.language-mermaid)').forEach(el => {
+    if (window.hljs) hljs.highlightElement(el);
+  });
+</script>
+</body>
+</html>

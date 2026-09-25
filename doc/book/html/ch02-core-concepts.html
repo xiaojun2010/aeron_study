@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 02 章 · 六个核心概念快览</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-light.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/index.min.js"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose" });
+</script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+                 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2em 1em 4em;
+    background: #fafafa;
+    color: #24292f;
+  }
+  .markdown-body {
+    background: #ffffff;
+    padding: 2.5em 3em;
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+  }
+  .markdown-body pre {
+    background: #f6f8fa !important;
+  }
+  .markdown-body pre.mermaid {
+    background: transparent !important;
+    text-align: center;
+    padding: 1em;
+  }
+  nav.chapter-nav {
+    display: flex;
+    justify-content: space-between;
+    padding: 1em;
+    margin-bottom: 1.5em;
+    background: #eef2f7;
+    border-radius: 8px;
+    font-size: 0.95em;
+  }
+  nav.chapter-nav a {
+    color: #0969da;
+    text-decoration: none;
+  }
+  nav.chapter-nav a:hover { text-decoration: underline; }
+  nav.chapter-nav .nav-link { min-width: 30%; }
+  nav.chapter-nav .nav-link.next { text-align: right; }
+  nav.chapter-nav .nav-link.home { text-align: center; }
+</style>
+</head>
+<body>
+<article class="markdown-body">
+<nav class="chapter-nav"><a href="ch01-why-aeron.html" class="nav-link">← 第 01 章 · 为什么选择 Aeron？消息模型对比</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch03-first-program.html" class="nav-link next">第 03 章 · 环境准备与第一个可运行程序 →</a></nav>
+<h1 id="02">第 02 章 · 六个核心概念快览</h1>
+<h2 id="_1">学习目标</h2>
+<ul>
+<li>记住 Aeron 的六个核心组件；</li>
+<li>用一张图串起来 MediaDriver / Aeron / Channel / Stream ID / Publication / Subscription 的关系；</li>
+<li>分辨"看起来像 Kafka 但语义完全不同"的坑。</li>
+</ul>
+<h2 id="_2">本章速览</h2>
+<pre class="mermaid">
+mindmap
+  root((Aeron 六件套))
+    MediaDriver::引擎
+      SHM
+      UDP
+    Aeron Client::入口
+      connect
+      addPublication
+      addSubscription
+    Channel::地址
+      aeron:ipc
+      aeron:udp
+    Stream ID::编号
+      1001
+      1002
+    Publication::发送端
+      offer
+      tryClaim
+    Subscription::接收端
+      poll
+      Image
+</pre>
+
+<p><strong>类比记忆</strong>：Channel = 高速公路号（G4、G60），Stream ID = 车道号，Publication = 上匝道，Subscription = 下匝道，MediaDriver = 高速公路管理局，Aeron Client = 你的车。</p>
+<h2 id="21">2.1 六个概念</h2>
+<div class="codehilite"><pre><span></span><code>Aeron
+│
+├── MediaDriver     数据运输引擎（进程 or 内嵌线程）
+│
+├── Aeron           Java Client（业务进程与 driver 通信的入口）
+│
+├── Channel         运输通道（URI，如 aeron:ipc / aeron:udp?...）
+│
+├── Stream ID       同一 channel 里的逻辑数据流（int）
+│
+├── Publication     发送端（≈ Producer，但 offer() 有返回值语义）
+│
+└── Subscription    接收端（≈ Consumer，但主动 poll，不是 callback）
+</code></pre></div>
+
+<h3 id="_3">一句话记忆</h3>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>一句话说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MediaDriver</td>
+<td>Aeron 真正干活的引擎，跑在共享内存文件之上</td>
+</tr>
+<tr>
+<td>Aeron (client)</td>
+<td>应用层与 driver 的 handshake 客户端，<code>Aeron.connect()</code> 得到</td>
+</tr>
+<tr>
+<td>Channel</td>
+<td>Aeron URI 字符串，定义"用什么介质发到哪"</td>
+</tr>
+<tr>
+<td>Stream ID</td>
+<td>32-bit 整数，把一个 channel 切成多路逻辑流</td>
+</tr>
+<tr>
+<td>Publication</td>
+<td><code>aeron.addPublication(channel, streamId)</code></td>
+</tr>
+<tr>
+<td>Subscription</td>
+<td><code>aeron.addSubscription(channel, streamId)</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="22">2.2 一次消息的完整时序</h2>
+<pre class="mermaid">
+sequenceDiagram
+    participant App1 as 业务进程 1
+    participant Pub as Publication
+    participant MD as MediaDriver<br/>(共享内存)
+    participant Sub as Subscription
+    participant App2 as 业务进程 2
+
+    App1->>Pub: aeron.addPublication(channel, stream)
+    App2->>Sub: aeron.addSubscription(channel, stream)
+    Pub-->>MD: 注册发送端
+    Sub-->>MD: 注册接收端
+    MD-->>Pub: isConnected=true
+    MD-->>Sub: isConnected=true
+
+    App1->>Pub: offer(buffer)
+    Pub->>MD: 写入 term buffer
+    Note over MD: 共享内存中就绪
+    App2->>Sub: poll(handler)
+    Sub->>MD: 读 term buffer
+    MD-->>Sub: 返回一段字节
+    Sub->>App2: handler.onFragment(buf,off,len)
+</pre>
+
+<h2 id="23">2.3 关系图</h2>
+<div class="codehilite"><pre><span></span><code>                          Machine A
+   ┌─────────────────────────────────────────────────────┐
+   │                                                     │
+   │   Business Process 1        Business Process 2      │
+   │   ┌──────────────┐          ┌──────────────┐        │
+   │   │ Aeron Client │          │ Aeron Client │        │
+   │   └──────┬───────┘          └──────▲───────┘        │
+   │          │ Publication              │ Subscription  │
+   │          ▼                          │               │
+   │   ┌─────────────────────────────────┴──────────┐    │
+   │   │                MediaDriver                 │    │
+   │   │   (读写共享内存 term buffer)                │    │
+   │   └────────────────────────────────────────────┘    │
+   │                                                     │
+   └─────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<p>同机器：所有客户端通过共享内存与 MediaDriver 通信，走 <code>aeron:ipc</code> 走的就是这条路径。
+跨机器：MediaDriver 内部的 sender/receiver 线程会把 term buffer 中的数据发到 UDP socket。</p>
+<h2 id="24-channel-stream-id">2.4 Channel + Stream ID = "在收发什么"</h2>
+<p>举例：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">String</span><span class="w"> </span><span class="n">channel</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">&quot;aeron:ipc&quot;</span><span class="p">;</span>
+<span class="kt">int</span><span class="w"> </span><span class="n">marketDataStream</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1001</span><span class="p">;</span>
+<span class="kt">int</span><span class="w"> </span><span class="n">orderStream</span><span class="w">      </span><span class="o">=</span><span class="w"> </span><span class="mi">1002</span><span class="p">;</span>
+<span class="kt">int</span><span class="w"> </span><span class="n">fillStream</span><span class="w">       </span><span class="o">=</span><span class="w"> </span><span class="mi">1003</span><span class="p">;</span>
+</code></pre></div>
+
+<p>约定：</p>
+<table>
+<thead>
+<tr>
+<th>Channel</th>
+<th>Stream ID</th>
+<th>语义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>aeron:ipc</code></td>
+<td>1001</td>
+<td>Binance 归一化行情</td>
+</tr>
+<tr>
+<td><code>aeron:ipc</code></td>
+<td>1002</td>
+<td>订单事件</td>
+</tr>
+<tr>
+<td><code>aeron:ipc</code></td>
+<td>1003</td>
+<td>成交回报</td>
+</tr>
+</tbody>
+</table>
+<p>Publisher 与 Subscriber 必须 <strong>完全一致</strong> 才能收到（channel 字符串一个字节都不能差）。</p>
+<h2 id="25-kafka">2.5 与 Kafka 的容易搞混的点</h2>
+<table>
+<thead>
+<tr>
+<th>直觉类比</th>
+<th>真相</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Stream ID ≈ Topic</td>
+<td>❌ Stream 只是 int，没有元数据；也没有分区</td>
+</tr>
+<tr>
+<td>Publication ≈ Producer</td>
+<td>✔ 但 <code>offer()</code> 不是 <code>send()</code>，见 Ch08</td>
+</tr>
+<tr>
+<td>Subscription ≈ Consumer</td>
+<td>✔ 但<strong>多个 Subscription 都会收到全量</strong>，见 Ch06</td>
+</tr>
+<tr>
+<td>Stream ID = broker 主题</td>
+<td>❌ 无 broker 概念，MediaDriver 只是传输引擎</td>
+</tr>
+<tr>
+<td>消费者用 group.id 分组</td>
+<td>❌ Aeron 无 group 概念，负载均衡靠业务分片</td>
+</tr>
+</tbody>
+</table>
+<h2 id="26-aeron-session">2.6 Aeron 与 "会话 (Session)"</h2>
+<p>一个 Publication 每次 <code>addPublication</code> 都会分配一个新的 <strong>sessionId</strong>（32-bit）。
+Subscriber 侧看到 <code>header.sessionId()</code> 就能区分"这条消息来自哪个 Publisher 实例"。</p>
+<div class="codehilite"><pre><span></span><code>Publisher_A -&gt; session=0x11abcd -&gt; Subscription
+Publisher_B -&gt; session=0x22ef00 -&gt; 同一个 Subscription
+                              ^
+Subscription 通过 sessionId 区分两条 image
+</code></pre></div>
+
+<p><code>Image</code> 是"某个 Publisher 会话在 Subscription 侧的镜像"，一个 Subscription 可能有多个 Image（多个 Publisher 同时打过来）。Ch13 会详细讲。</p>
+<h2 id="27-aeron-log">2.7 心智模型：Aeron 是"共享 log + 独立读游标"</h2>
+<div class="codehilite"><pre><span></span><code>Publisher.offer(msg)
+        │
+        ▼
+┌──────────────────────────────────┐
+│   Term Buffer (环形 log)         │
+│   ... msg_98 msg_99 msg_100 ...  │
+└──────────────────────────────────┘
+        ▲                ▲                ▲
+        │                │                │
+   Sub A pos=97     Sub B pos=99     Sub C pos=100
+</code></pre></div>
+
+<ul>
+<li>每个 Subscription 都是"独立读游标"</li>
+<li>Publisher 只是往 log 里追加</li>
+<li>MediaDriver 会根据 <strong>最慢的</strong>订阅者的位置来决定"log 什么时候可以覆盖"（IPC 场景）</li>
+</ul>
+<p>这就是 Aeron 广播语义 + 流控的物理基础。Ch13 讲 Term Buffer 内部，Ch14 讲流控。</p>
+<h2 id="28">2.8 小结</h2>
+<ul>
+<li>六个组件 + 一张图 = Aeron 的骨架</li>
+<li>不要生搬 Kafka 的心智模型</li>
+<li>下一章我们把 pom.xml、log4j2、demo01 全部跑起来</li>
+</ul>
+<nav class="chapter-nav"><a href="ch01-why-aeron.html" class="nav-link">← 第 01 章 · 为什么选择 Aeron？消息模型对比</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch03-first-program.html" class="nav-link next">第 03 章 · 环境准备与第一个可运行程序 →</a></nav>
+</article>
+<script>
+  // 高亮所有非 mermaid 代码块
+  document.querySelectorAll('pre code:not(.language-mermaid)').forEach(el => {
+    if (window.hljs) hljs.highlightElement(el);
+  });
+</script>
+</body>
+</html>

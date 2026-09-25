@@ -7,6 +7,28 @@
 - 深入理解 Back Pressure 在 Aeron 中的物理机制；
 - 明白 Aeron 的"可靠传输"到底可靠到哪一层。
 
+## 本章速览：offer 决策树
+
+```mermaid
+flowchart TD
+    S[offer buffer] --> R{返回值}
+    R -->|>= 0| OK[成功<br/>拿到新 position]
+    R -->|-1 NOT_CONNECTED| NC[无订阅者<br/>短等或降级]
+    R -->|-2 BACK_PRESSURED| BP[消费者跟不上<br/>业务决定 等/丢/合并]
+    R -->|-3 ADMIN_ACTION| AA[driver 内部动作<br/>立即重试]
+    R -->|-4 CLOSED| CL[Pub 已关闭<br/>停止发送]
+    R -->|-5 MAX_POSITION_EXCEEDED| ME[流耗尽<br/>重建 Pub]
+
+    style OK fill:#caffbf
+    style NC fill:#fdffb6
+    style BP fill:#ffd6a5
+    style AA fill:#a0c4ff
+    style CL fill:#fde8e8
+    style ME fill:#fde8e8
+```
+
+**记忆**：把 offer 想象成"往传送带上放包裹"——传送带满了（BackPressure）、传送带没接（NotConnected）、传送带在换轨（AdminAction），你都要有对应策略，不能假装成功。
+
 ## 8.1 offer 的完整返回值
 
 ```java
@@ -83,6 +105,25 @@ publisherLimit = min(consumerPositions) + termWindowLength
 ```
 
 `termWindowLength` 通常是 `term-length / 2`。当 Publisher 试图 `offer` 超过 limit 时，`offer()` 返回 `BACK_PRESSURED`。
+
+**window 可视化**：
+
+```mermaid
+flowchart LR
+    subgraph TERM["term buffer (16 MB)"]
+        direction LR
+        SLOW[慢消费者<br/>pos=2 MB] --> WINDOW["window=8 MB"]
+        WINDOW --> LIMIT[publisherLimit<br/>pos=10 MB]
+        LIMIT --> TAIL[禁写区]
+    end
+    P[Publisher<br/>想写 pos=11 MB] -.->|BACK_PRESSURED| LIMIT
+    style SLOW fill:#fde8e8
+    style WINDOW fill:#caffbf
+    style LIMIT fill:#ffd6a5
+    style TAIL fill:#e5e5e5
+```
+
+**记忆**：`publisherLimit = 最慢消费者 + window`。谁最慢，谁决定 Publisher 能跑多远。
 
 图示：
 

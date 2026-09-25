@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    log4j2 配置：
+    * Console 输出，带线程名和 logger 简名，方便观察 Publisher / Subscriber 线程交互
+    * 默认 INFO；Aeron 内部日志设为 WARN 避免刷屏
+-->
+<Configuration status="WARN">
+    <Appenders>
+        <Console name="Console" target="SYSTEM_OUT">
+            <PatternLayout pattern="%d{HH:mm:ss.SSS} [%t] %-5level %logger{1} - %msg%n"/>
+        </Console>
+    </Appenders>
+
+    <Loggers>
+        <!-- Aeron / Agrona 内部日志：太吵，压到 WARN -->
+        <Logger name="io.aeron" level="WARN"/>
+        <Logger name="org.agrona" level="WARN"/>
+
+        <!-- 应用 demo 日志 -->
+        <Logger name="org.example" level="INFO"/>
+        <Logger name="self" level="INFO"/>
+
+        <Root level="INFO">
+            <AppenderRef ref="Console"/>
+        </Root>
+    </Loggers>
+</Configuration>

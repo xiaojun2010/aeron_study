@@ -7,6 +7,25 @@
 - 学会调整 term buffer 大小、目录路径、超时时间；
 - 能独立部署 MediaDriver 给多个业务进程共用。
 
+## 本章速览
+
+```mermaid
+flowchart TB
+    subgraph Embedded["方案 A：嵌入式（学习/测试）"]
+        JVM1[业务 JVM] --> D1[内嵌 driver 线程]
+        D1 --> SHM1[(共享内存<br/>随机目录)]
+    end
+    subgraph Standalone["方案 B：独立部署（生产）"]
+        DP[driver 进程<br/>systemd 管]
+        DP --> SHM2[(共享内存<br/>固定目录)]
+        JVM2[业务 JVM A] -->|Aeron.connect| SHM2
+        JVM3[业务 JVM B] -->|Aeron.connect| SHM2
+        JVM4[业务 JVM C] -->|Aeron.connect| SHM2
+    end
+    style Embedded fill:#e8f4fd
+    style Standalone fill:#fef3c7
+```
+
 ## 4.1 MediaDriver 是什么
 
 Aeron 真正干活的进程 / 线程。它的核心职责：
@@ -59,6 +78,30 @@ MediaDriver driver = MediaDriver.launchEmbedded();
 | `SHARED` | 1（三合一） | 学习 / 低负载 / CPU 紧张 |
 | `INVOKER` | 0（不启 driver 线程，业务代码手动调 `invoke()`） | 单线程模型，用于内嵌到 Netty EventLoop 等 |
 
+**线程模型可视化**：
+
+```mermaid
+flowchart LR
+    subgraph DEDICATED["DEDICATED（生产标配）"]
+        direction TB
+        C1[Conductor 线程]
+        S1[Sender 线程]
+        R1[Receiver 线程]
+    end
+    subgraph SHARED_NETWORK["SHARED_NETWORK（中等）"]
+        direction TB
+        C2[Conductor 线程]
+        SR2["Sender+Receiver<br/>合线程"]
+    end
+    subgraph SHARED["SHARED（demo/低负载）"]
+        direction TB
+        ALL["Conductor+Sender+Receiver<br/>全部一个线程"]
+    end
+    style DEDICATED fill:#caffbf
+    style SHARED_NETWORK fill:#fdffb6
+    style SHARED fill:#ffd6a5
+```
+
 配置示例：
 
 ```java
@@ -96,6 +139,22 @@ ctx.dirDeleteOnStart(true).dirDeleteOnShutdown(true);
 ### 4.4.4 Term Buffer 大小
 
 Aeron 的每个 Publication 都有 3 个 term buffer（三段循环）：
+
+```mermaid
+flowchart LR
+    P[Publisher] -->|写入| T0["term[0]<br/>16 MB"]
+    T0 -.->|写满切换| T1["term[1]<br/>16 MB"]
+    T1 -.->|写满切换| T2["term[2]<br/>16 MB"]
+    T2 -.->|回到 0| T0
+    C[Subscriber<br/>consumer position] --> T0
+    C -.-> T1
+    C -.-> T2
+    style T0 fill:#caffbf
+    style T1 fill:#fdffb6
+    style T2 fill:#ffd6a5
+```
+
+**记忆**：三个 term 循环，就像三个跑道轮流用；某个跑道消费者还没走完，Publisher 就得停下（BackPressure）。
 
 ```java
 ctx.publicationTermBufferLength(1 << 24);         // 16 MB × 3 = 48 MB

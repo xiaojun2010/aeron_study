@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 08 章 · offer 返回值与 Back Pressure</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-light.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/index.min.js"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose" });
+</script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+                 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2em 1em 4em;
+    background: #fafafa;
+    color: #24292f;
+  }
+  .markdown-body {
+    background: #ffffff;
+    padding: 2.5em 3em;
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+  }
+  .markdown-body pre {
+    background: #f6f8fa !important;
+  }
+  .markdown-body pre.mermaid {
+    background: transparent !important;
+    text-align: center;
+    padding: 1em;
+  }
+  nav.chapter-nav {
+    display: flex;
+    justify-content: space-between;
+    padding: 1em;
+    margin-bottom: 1.5em;
+    background: #eef2f7;
+    border-radius: 8px;
+    font-size: 0.95em;
+  }
+  nav.chapter-nav a {
+    color: #0969da;
+    text-decoration: none;
+  }
+  nav.chapter-nav a:hover { text-decoration: underline; }
+  nav.chapter-nav .nav-link { min-width: 30%; }
+  nav.chapter-nav .nav-link.next { text-align: right; }
+  nav.chapter-nav .nav-link.home { text-align: center; }
+</style>
+</head>
+<body>
+<article class="markdown-body">
+<nav class="chapter-nav"><a href="ch07-channel-uri.html" class="nav-link">← 第 07 章 · Channel URI 完全指南</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch09-idle-strategy.html" class="nav-link next">第 09 章 · IdleStrategy 与低延迟循环设计 →</a></nav>
+<h1 id="08-offer-back-pressure">第 08 章 · offer 返回值与 Back Pressure</h1>
+<h2 id="_1">学习目标</h2>
+<ul>
+<li>记住 Publication 的 5 种负值返回值的语义；</li>
+<li>会写"分类型处理"的健壮 offer 循环；</li>
+<li>深入理解 Back Pressure 在 Aeron 中的物理机制；</li>
+<li>明白 Aeron 的"可靠传输"到底可靠到哪一层。</li>
+</ul>
+<h2 id="offer">本章速览：offer 决策树</h2>
+<pre class="mermaid">
+flowchart TD
+    S[offer buffer] --> R{返回值}
+    R -->|>= 0| OK[成功<br/>拿到新 position]
+    R -->|-1 NOT_CONNECTED| NC[无订阅者<br/>短等或降级]
+    R -->|-2 BACK_PRESSURED| BP[消费者跟不上<br/>业务决定 等/丢/合并]
+    R -->|-3 ADMIN_ACTION| AA[driver 内部动作<br/>立即重试]
+    R -->|-4 CLOSED| CL[Pub 已关闭<br/>停止发送]
+    R -->|-5 MAX_POSITION_EXCEEDED| ME[流耗尽<br/>重建 Pub]
+
+    style OK fill:#caffbf
+    style NC fill:#fdffb6
+    style BP fill:#ffd6a5
+    style AA fill:#a0c4ff
+    style CL fill:#fde8e8
+    style ME fill:#fde8e8
+</pre>
+
+<p><strong>记忆</strong>：把 offer 想象成"往传送带上放包裹"——传送带满了（BackPressure）、传送带没接（NotConnected）、传送带在换轨（AdminAction），你都要有对应策略，不能假装成功。</p>
+<h2 id="81-offer">8.1 offer 的完整返回值</h2>
+<div class="codehilite"><pre><span></span><code><span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">Publication</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">NOT_CONNECTED</span><span class="w">          </span><span class="o">=</span><span class="w"> </span><span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">BACK_PRESSURED</span><span class="w">         </span><span class="o">=</span><span class="w"> </span><span class="o">-</span><span class="mi">2</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">ADMIN_ACTION</span><span class="w">           </span><span class="o">=</span><span class="w"> </span><span class="o">-</span><span class="mi">3</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">CLOSED</span><span class="w">                 </span><span class="o">=</span><span class="w"> </span><span class="o">-</span><span class="mi">4</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">MAX_POSITION_EXCEEDED</span><span class="w">  </span><span class="o">=</span><span class="w"> </span><span class="o">-</span><span class="mi">5</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<table>
+<thead>
+<tr>
+<th>值</th>
+<th>何时发生</th>
+<th>建议处理</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>&gt; 0</code></td>
+<td>成功，值 = 新的 stream position</td>
+<td>✔</td>
+</tr>
+<tr>
+<td><code>NOT_CONNECTED</code> (-1)</td>
+<td>还没有 Subscriber，or 全部掉线</td>
+<td>等一会儿；业务上决定是否降级</td>
+</tr>
+<tr>
+<td><code>BACK_PRESSURED</code> (-2)</td>
+<td>消费者跟不上，term buffer 无空闲</td>
+<td>业务上决定：等 / 丢 / 合并 / 降采样</td>
+</tr>
+<tr>
+<td><code>ADMIN_ACTION</code> (-3)</td>
+<td>Driver 内部管理动作（term rotate）</td>
+<td>立即重试</td>
+</tr>
+<tr>
+<td><code>CLOSED</code> (-4)</td>
+<td>Publication 已关闭</td>
+<td>停止发送</td>
+</tr>
+<tr>
+<td><code>MAX_POSITION_EXCEEDED</code> (-5)</td>
+<td>流位置耗尽（几乎不可能，<code>2^63 / term_length</code> 个 term 之后）</td>
+<td>重建 Publication</td>
+</tr>
+</tbody>
+</table>
+<h2 id="82">8.2 反例：新手的写法</h2>
+<div class="codehilite"><pre><span></span><code><span class="n">publication</span><span class="p">.</span><span class="na">offer</span><span class="p">(</span><span class="n">buffer</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">length</span><span class="p">);</span><span class="w">   </span><span class="c1">// ← 完全丢弃返回值</span>
+</code></pre></div>
+
+<p>上层看不到 BackPressure 或 NotConnected，消息就这么"消失"了。这是 Aeron 代码 review 里的第一条大雷。</p>
+<h2 id="83">8.3 正确的分类型处理</h2>
+<div class="codehilite"><pre><span></span><code><span class="kt">long</span><span class="w"> </span><span class="n">r</span><span class="p">;</span>
+<span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="kc">true</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">r</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">pub</span><span class="p">.</span><span class="na">offer</span><span class="p">(</span><span class="n">buffer</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">len</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">r</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="k">break</span><span class="p">;</span><span class="w">                                   </span><span class="c1">// 成功</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">r</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">Publication</span><span class="p">.</span><span class="na">NOT_CONNECTED</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 完全没有订阅者：等一下</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">++</span><span class="n">notConnectedTries</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="n">MAX_NC_TRIES</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="c1">// 上层告警：下游全丢了</span>
+<span class="w">            </span><span class="n">metrics</span><span class="p">.</span><span class="na">mark</span><span class="p">(</span><span class="s">&quot;pub.no_subscriber&quot;</span><span class="p">);</span>
+<span class="w">            </span><span class="k">break</span><span class="p">;</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="n">Thread</span><span class="p">.</span><span class="na">sleep</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">r</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">Publication</span><span class="p">.</span><span class="na">BACK_PRESSURED</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 下游跟不上：业务决定</span>
+<span class="w">        </span><span class="n">metrics</span><span class="p">.</span><span class="na">mark</span><span class="p">(</span><span class="s">&quot;pub.back_pressured&quot;</span><span class="p">);</span>
+<span class="w">        </span><span class="n">backpressurePolicy</span><span class="p">.</span><span class="na">onBackPressure</span><span class="p">(</span><span class="n">msg</span><span class="p">);</span>
+<span class="w">        </span><span class="n">Thread</span><span class="p">.</span><span class="na">yield</span><span class="p">();</span>
+<span class="w">    </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">r</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">Publication</span><span class="p">.</span><span class="na">ADMIN_ACTION</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 内部维护，立即重试</span>
+<span class="w">    </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">r</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">Publication</span><span class="p">.</span><span class="na">CLOSED</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">log</span><span class="p">.</span><span class="na">error</span><span class="p">(</span><span class="s">&quot;Publication 已关闭&quot;</span><span class="p">);</span>
+<span class="w">        </span><span class="k">return</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">r</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">Publication</span><span class="p">.</span><span class="na">MAX_POSITION_EXCEEDED</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">log</span><span class="p">.</span><span class="na">error</span><span class="p">(</span><span class="s">&quot;流位置耗尽，需要新建 Publication&quot;</span><span class="p">);</span>
+<span class="w">        </span><span class="n">rotatePublication</span><span class="p">();</span>
+<span class="w">        </span><span class="k">break</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h2 id="84-back-pressure">8.4 Back Pressure 的物理机制</h2>
+<p>term buffer 上有两个 position：</p>
+<ul>
+<li><code>publisherLimit</code> = 允许 Publisher 写到的最远位置</li>
+<li>各个 Subscriber 的 <code>consumerPosition</code></li>
+</ul>
+<p>driver 会不断计算：</p>
+<div class="codehilite"><pre><span></span><code>publisherLimit = min(consumerPositions) + termWindowLength
+</code></pre></div>
+
+<p><code>termWindowLength</code> 通常是 <code>term-length / 2</code>。当 Publisher 试图 <code>offer</code> 超过 limit 时，<code>offer()</code> 返回 <code>BACK_PRESSURED</code>。</p>
+<p><strong>window 可视化</strong>：</p>
+<pre class="mermaid">
+flowchart LR
+    subgraph TERM["term buffer (16 MB)"]
+        direction LR
+        SLOW[慢消费者<br/>pos=2 MB] --> WINDOW["window=8 MB"]
+        WINDOW --> LIMIT[publisherLimit<br/>pos=10 MB]
+        LIMIT --> TAIL[禁写区]
+    end
+    P[Publisher<br/>想写 pos=11 MB] -.->|BACK_PRESSURED| LIMIT
+    style SLOW fill:#fde8e8
+    style WINDOW fill:#caffbf
+    style LIMIT fill:#ffd6a5
+    style TAIL fill:#e5e5e5
+</pre>
+
+<p><strong>记忆</strong>：<code>publisherLimit = 最慢消费者 + window</code>。谁最慢，谁决定 Publisher 能跑多远。</p>
+<p>图示：</p>
+<div class="codehilite"><pre><span></span><code>term 0 (T=16MB, window=8MB)
+├───────────────────────────────────────┤
+0    slow_consumer=2M         pubLimit=10M   T
+                                  ↑
+                          Publisher 到这就阻塞了
+</code></pre></div>
+
+<h2 id="85-ipc-vs-udp-back-pressure">8.5 IPC vs UDP 的 Back Pressure 差异</h2>
+<ul>
+<li><strong>IPC</strong>：消费者慢 = Publisher 慢，物理上完全同步</li>
+<li><strong>UDP unicast</strong>：Publisher 端等对方 SM (Status Message) 更新 consumer position，如果对方掉线，退化成 <code>NOT_CONNECTED</code></li>
+<li><strong>UDP multicast</strong>：所有订阅者共享一个 flow control 目标（Ch14 详解 min/max flow control）</li>
+</ul>
+<h2 id="86-back-pressure">8.6 业务侧 Back Pressure 策略</h2>
+<p>Aeron 只告诉你"消费者跟不上"，怎么办要你自己决定：</p>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>等待</strong>（yield/sleep）</td>
+<td>关键订单流不能丢；下游偶尔慢</td>
+</tr>
+<tr>
+<td><strong>丢弃</strong>（drop）</td>
+<td>行情、探针，最新一条最有价值</td>
+</tr>
+<tr>
+<td><strong>合并</strong>（coalesce）</td>
+<td>深度快照，可以合并成一条</td>
+</tr>
+<tr>
+<td><strong>降采样</strong>（downsample）</td>
+<td>Tick 数据太密，可以每 N 条采一条</td>
+</tr>
+<tr>
+<td><strong>溢出到磁盘</strong>（overflow to Archive）</td>
+<td>需要事后回放</td>
+</tr>
+<tr>
+<td><strong>扩容</strong>（更多 subscriber worker）</td>
+<td>长期跟不上，加机器</td>
+</tr>
+</tbody>
+</table>
+<h2 id="87-tryclaim-back-pressure">8.7 tryClaim 的 Back Pressure</h2>
+<p><code>tryClaim</code> 与 <code>offer</code> 完全相同的负值语义：</p>
+<div class="codehilite"><pre><span></span><code><span class="kt">long</span><span class="w"> </span><span class="n">r</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">pub</span><span class="p">.</span><span class="na">tryClaim</span><span class="p">(</span><span class="n">msgLen</span><span class="p">,</span><span class="w"> </span><span class="n">claim</span><span class="p">);</span>
+<span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">r</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="cm">/* 相同处理 */</span><span class="w"> </span><span class="k">return</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="c1">// 写 claim...</span>
+<span class="n">claim</span><span class="p">.</span><span class="na">commit</span><span class="p">();</span>
+</code></pre></div>
+
+<p>区别只在于成功路径：拿到 buffer 直接写，不用再 offer。</p>
+<h2 id="88-aeron">8.8 Aeron 的"可靠"到底可靠到哪一层</h2>
+<p>Aeron 提供的保障：</p>
+<ol>
+<li><strong>有序</strong>：同一个 stream 上，消息顺序不会颠倒；</li>
+<li><strong>不丢</strong>（对于 reliable=true UDP + IPC）：driver 层负责重传；</li>
+<li><strong>不重复</strong>：driver 层去重。</li>
+</ol>
+<p>Aeron <strong>不</strong> 提供的保障：</p>
+<ol>
+<li>消费者应用层"处理成功"后的 ack 语义（要 exactly-once 得业务自己做）；</li>
+<li>Publisher 崩溃恢复后的续传（用 Archive）；</li>
+<li>Subscriber 崩溃后从上次 position 恢复（要业务保存 position）。</li>
+</ol>
+<h2 id="89">8.9 常见问题</h2>
+<p><strong>Q: 为什么我的 offer 一直 BACK_PRESSURED？</strong></p>
+<p>排查顺序：
+1. 消费者线程是不是 sleep 太多、handler 太慢？
+2. term-length 是不是太小？
+3. IPC 模式是否所有 Subscriber 都在正常 poll？
+4. UDP 是否 SM 丢包（<code>AeronStat</code> 看丢包计数）？</p>
+<p><strong>Q: NOT_CONNECTED 何时消失？</strong></p>
+<ul>
+<li>IPC：至少一个 Subscription 在同 (channel, streamId) 上 add 成功</li>
+<li>UDP：Subscriber 发了第一个 SM</li>
+</ul>
+<p><strong>Q: 高频交易场景 offer 出错允许 sleep 吗？</strong></p>
+<p>不建议 sleep（哪怕 1ms 都太长），一般 spin + <code>Thread.onSpinWait()</code>。见 Ch09。</p>
+<h2 id="810">8.10 小结</h2>
+<ul>
+<li>offer 的负值一个都不能漏</li>
+<li>Back Pressure 是 Aeron 的核心保护机制，不是异常</li>
+<li>业务层必须给出"消费者跟不上怎么办"的答案</li>
+</ul>
+<nav class="chapter-nav"><a href="ch07-channel-uri.html" class="nav-link">← 第 07 章 · Channel URI 完全指南</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch09-idle-strategy.html" class="nav-link next">第 09 章 · IdleStrategy 与低延迟循环设计 →</a></nav>
+</article>
+<script>
+  // 高亮所有非 mermaid 代码块
+  document.querySelectorAll('pre code:not(.language-mermaid)').forEach(el => {
+    if (window.hljs) hljs.highlightElement(el);
+  });
+</script>
+</body>
+</html>

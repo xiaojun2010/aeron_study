@@ -7,6 +7,33 @@
 - 知道 IGMP、`interface` 参数的用途；
 - 明白组播 flow control 的独特性。
 
+## 本章速览：组播 vs 单播 vs MDC
+
+```mermaid
+flowchart LR
+    subgraph U["单播 (Unicast) - N 份"]
+        UP[Publisher] --> US1[Sub A]
+        UP --> US2[Sub B]
+        UP --> US3[Sub C]
+    end
+    subgraph M["组播 (Multicast) - 1 份"]
+        MP[Publisher] --> MG((组播地址<br/>239.x.y.z))
+        MG --> MS1[Sub A]
+        MG --> MS2[Sub B]
+        MG --> MS3[Sub C]
+    end
+    subgraph D["MDC - N 份但 API 单发"]
+        DP[Publisher<br/>单次 offer] --> DE[MediaDriver<br/>fan-out N 个 UDP]
+        DE --> DS1[Sub A]
+        DE --> DS2[Sub B]
+        DE --> DS3[Sub C]
+    end
+    style M fill:#caffbf
+    style D fill:#a0c4ff
+```
+
+**记忆**：组播 = 一次 offer，一份 UDP 出去（交换机复制）；MDC = 一次 offer，N 份 UDP 出去（driver 复制）。
+
 ## 16.1 何时使用组播
 
 一发多收、订阅方数量不确定或经常变动 → 组播。典型场景：

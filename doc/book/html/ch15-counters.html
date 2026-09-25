@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 15 章 · Counters 与诊断</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-light.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/index.min.js"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose" });
+</script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+                 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2em 1em 4em;
+    background: #fafafa;
+    color: #24292f;
+  }
+  .markdown-body {
+    background: #ffffff;
+    padding: 2.5em 3em;
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+  }
+  .markdown-body pre {
+    background: #f6f8fa !important;
+  }
+  .markdown-body pre.mermaid {
+    background: transparent !important;
+    text-align: center;
+    padding: 1em;
+  }
+  nav.chapter-nav {
+    display: flex;
+    justify-content: space-between;
+    padding: 1em;
+    margin-bottom: 1.5em;
+    background: #eef2f7;
+    border-radius: 8px;
+    font-size: 0.95em;
+  }
+  nav.chapter-nav a {
+    color: #0969da;
+    text-decoration: none;
+  }
+  nav.chapter-nav a:hover { text-decoration: underline; }
+  nav.chapter-nav .nav-link { min-width: 30%; }
+  nav.chapter-nav .nav-link.next { text-align: right; }
+  nav.chapter-nav .nav-link.home { text-align: center; }
+</style>
+</head>
+<body>
+<article class="markdown-body">
+<nav class="chapter-nav"><a href="ch14-flow-control.html" class="nav-link">← 第 14 章 · 流控、拥塞控制与 Loss Recovery</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch16-multicast.html" class="nav-link next">第 16 章 · UDP Multicast →</a></nav>
+<h1 id="15-counters">第 15 章 · Counters 与诊断</h1>
+<h2 id="_1">学习目标</h2>
+<ul>
+<li>理解 Aeron 的 Counters 系统（共享内存 counter file）；</li>
+<li>学会用 <code>AeronStat</code> / <code>CncFileReader</code> 观察运行时状态；</li>
+<li>认识常用系统 counter；</li>
+<li>能自定义业务 counter 挂到 Aeron 上，一并被工具观察。</li>
+</ul>
+<h2 id="cncdat">本章速览：cnc.dat 里到底存什么</h2>
+<pre class="mermaid">
+flowchart TB
+    subgraph CNC["cnc.dat（driver 目录下）"]
+        HDR[Header<br/>版本 + buffer 长度]
+        TD[to-driver ring<br/>client → driver 命令]
+        TC[to-clients broadcast<br/>driver → client 事件]
+        CV[counter values buffer<br/>★ 所有 counter 值]
+        CM[counter metadata<br/>counter 名字/标签]
+        EL[error log<br/>异常环形 buffer]
+    end
+    subgraph TOOLS[外部工具]
+        STAT[AeronStat CLI]
+        MON[自研 exporter]
+        ERR[ErrorLogReader]
+    end
+    STAT -->|mmap 读| CV
+    MON -->|mmap 读| CV
+    ERR -->|mmap 读| EL
+    style CV fill:#caffbf
+    style EL fill:#ffd6a5
+</pre>
+
+<h2 id="151-cnc-counter">15.1 Cnc &amp; Counter 概览</h2>
+<p>driver 目录下 <code>cnc.dat</code> 是所有 driver ↔ client 通信的元数据文件。其中一段专门给"counter"用：</p>
+<div class="codehilite"><pre><span></span><code>cnc.dat
+├── header (version, buffer lengths)
+├── to-driver ring buffer          (client → driver 命令)
+├── to-clients broadcast buffer    (driver → client 事件)
+├── counter values buffer          ← 观察工具关心
+├── counter metadata buffer        ← 名字、标签
+└── error log
+</code></pre></div>
+
+<p>每个 counter 是 128 字节对齐的槽，含 8 字节的 volatile long value + metadata。</p>
+<h2 id="152-aeronstat">15.2 AeronStat 工具</h2>
+<p>Aeron 官方 samples 里有个命令行工具 <code>AeronStat</code>，直接 <code>mmap</code> cnc.dat 打印所有 counter：</p>
+<div class="codehilite"><pre><span></span><code>java<span class="w"> </span>-cp<span class="w"> </span>aeron-samples-1.44.1-all.jar<span class="w"> </span>io.aeron.samples.AeronStat<span class="w"> </span><span class="se">\</span>
+<span class="w">     </span>-Daeron.dir<span class="o">=</span>/var/folders/xxx/aeron-zxj-xxx
+</code></pre></div>
+
+<p>典型输出：</p>
+<div class="codehilite"><pre><span></span><code>1:                   0 - Bytes sent
+2:               12345 - Bytes received
+3:                   0 - Failed offers
+4:                   0 - Errors
+5:                42 - Loss gap fills
+...
+100:  pub-lmt 0:1001:4c9c5b4a - 4194304
+101:  pub-pos 0:1001:4c9c5b4a - 3145728
+102:  sub-pos 0:1001:4c9c5b4a:client-1 - 2097152
+</code></pre></div>
+
+<p>线上排障必备。</p>
+<h2 id="153-counter">15.3 常用系统 counter</h2>
+<table>
+<thead>
+<tr>
+<th>名字</th>
+<th>含义</th>
+<th>出问题的迹象</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Bytes sent</code> / <code>Bytes received</code></td>
+<td>总字节</td>
+<td>数字停滞 = 流量断</td>
+</tr>
+<tr>
+<td><code>Failed offers</code></td>
+<td>offer 返回负值的次数</td>
+<td>增长快 = BackPressure</td>
+</tr>
+<tr>
+<td><code>Client keep-alives</code></td>
+<td>client → driver 心跳</td>
+<td>停滞 = client 挂掉</td>
+</tr>
+<tr>
+<td><code>Errors</code></td>
+<td>错误计数</td>
+<td>&gt;0 立刻查 error log</td>
+</tr>
+<tr>
+<td><code>Loss gap fills</code></td>
+<td>通过 NAK 补回来的字节</td>
+<td>增长快 = 网络丢包严重</td>
+</tr>
+<tr>
+<td><code>Publisher back-pressured</code></td>
+<td>Publisher BackPressure 次数</td>
+<td>需要业务侧优化</td>
+</tr>
+<tr>
+<td><code>Publisher NAK count</code></td>
+<td>收到 NAK 数</td>
+<td>与 Loss 相关</td>
+</tr>
+<tr>
+<td><code>Sender flow control limit</code></td>
+<td>发送 window</td>
+<td>判断是否被流控卡住</td>
+</tr>
+<tr>
+<td><code>Subscription connect events</code></td>
+<td>订阅上下线</td>
+<td>频繁抖动 = 网络问题</td>
+</tr>
+<tr>
+<td><code>Publication limit</code> (<code>pub-lmt</code>)</td>
+<td>Publisher 允许写到的位置</td>
+<td>逼近 pub-pos 说明满</td>
+</tr>
+<tr>
+<td><code>Publication position</code> (<code>pub-pos</code>)</td>
+<td>Publisher 当前位置</td>
+<td>增长速度 = 吞吐</td>
+</tr>
+<tr>
+<td><code>Subscription position</code> (<code>sub-pos</code>)</td>
+<td>每个订阅方位置</td>
+<td>pub-pos - sub-pos = 积压</td>
+</tr>
+</tbody>
+</table>
+<h2 id="154">15.4 计算"积压"</h2>
+<div class="codehilite"><pre><span></span><code>backlog_bytes = pub-pos - min(sub-pos_i)
+</code></pre></div>
+
+<p>监控这个数即可看到"消费者是否跟得上"。IPC 场景 backlog 一旦逼近 term-length，就要注意即将 BackPressure。</p>
+<p><strong>积压可视化</strong>：</p>
+<div class="codehilite"><pre><span></span><code>term-length = 16 MB, window = 8 MB
+
+pub-pos ─────────────────────┐
+                             ▼
+[═══════════════════════════════════════]  term buffer
+ ▲              ▲                     ▲
+ │              │                     │
+ sub-pos-slow   sub-pos-fast          pub-pos
+ (2 MB)         (10 MB)               (11 MB)
+
+backlog vs 慢消费者 = 9 MB   ← 已超过 window/2, 危险
+backlog vs 快消费者 = 1 MB   ← 健康
+</code></pre></div>
+
+<h2 id="155-cncfilereader">15.5 CncFileReader（编程方式）</h2>
+<p>如果你想在自己的监控 agent 里读 counter，用 API：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">try</span><span class="w"> </span><span class="p">(</span><span class="n">CncFileDescriptor</span><span class="w"> </span><span class="n">cncFile</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">CncFileDescriptor</span><span class="p">(...);</span>
+<span class="w">     </span><span class="n">CountersReader</span><span class="w"> </span><span class="n">counters</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">CountersReader</span><span class="p">(</span>
+<span class="w">         </span><span class="n">cncFile</span><span class="p">.</span><span class="na">createCountersMetaDataBuffer</span><span class="p">(),</span>
+<span class="w">         </span><span class="n">cncFile</span><span class="p">.</span><span class="na">createCountersValuesBuffer</span><span class="p">()))</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="n">counters</span><span class="p">.</span><span class="na">forEach</span><span class="p">((</span><span class="n">counterId</span><span class="p">,</span><span class="w"> </span><span class="n">typeId</span><span class="p">,</span><span class="w"> </span><span class="n">keyBuffer</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kt">long</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">counters</span><span class="p">.</span><span class="na">getCounterValue</span><span class="p">(</span><span class="n">counterId</span><span class="p">);</span>
+<span class="w">        </span><span class="n">log</span><span class="p">.</span><span class="na">info</span><span class="p">(</span><span class="s">&quot;[{}] {} = {}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">counterId</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">value</span><span class="p">);</span>
+<span class="w">    </span><span class="p">});</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h2 id="156-counter">15.6 自定义业务 counter</h2>
+<p>Aeron 允许你注册自己的 counter：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">AtomicCounter</span><span class="w"> </span><span class="n">myCounter</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">aeron</span><span class="p">.</span><span class="na">addCounter</span><span class="p">(</span>
+<span class="w">    </span><span class="mi">1000</span><span class="p">,</span><span class="w">                                      </span><span class="c1">// typeId</span>
+<span class="w">    </span><span class="s">&quot;market-orders-processed&quot;</span><span class="p">.</span><span class="na">getBytes</span><span class="p">(),</span><span class="w">      </span><span class="c1">// key</span>
+<span class="w">    </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="s">&quot;.&quot;</span><span class="p">.</span><span class="na">getBytes</span><span class="p">().</span><span class="na">length</span><span class="p">,</span>
+<span class="w">    </span><span class="s">&quot;market orders processed&quot;</span><span class="p">.</span><span class="na">getBytes</span><span class="p">(),</span><span class="w">       </span><span class="c1">// label</span>
+<span class="w">    </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="s">&quot;market orders processed&quot;</span><span class="p">.</span><span class="na">length</span><span class="p">());</span>
+
+<span class="c1">// 使用</span>
+<span class="n">myCounter</span><span class="p">.</span><span class="na">increment</span><span class="p">();</span>
+<span class="n">myCounter</span><span class="p">.</span><span class="na">setOrdered</span><span class="p">(</span><span class="mi">1234</span><span class="p">);</span>
+</code></pre></div>
+
+<p>好处：AeronStat / 你的监控 agent 一并能看到，不用再另开一套 metric。</p>
+<h2 id="157-error-log">15.7 Error Log</h2>
+<p>driver 目录下 <code>${aeronDir}/error-log.dat</code> 是所有异常的 mmap 环形 buffer，用 <code>ErrorLogReader</code> 读：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">ErrorLogReader</span><span class="p">.</span><span class="na">read</span><span class="p">(</span><span class="n">errorLogBuf</span><span class="p">,</span><span class="w"> </span><span class="p">(</span><span class="n">observationCount</span><span class="p">,</span><span class="w"> </span><span class="n">firstObservationTs</span><span class="p">,</span><span class="w"> </span><span class="n">lastObservationTs</span><span class="p">,</span><span class="w"> </span><span class="n">encodedException</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">log</span><span class="p">.</span><span class="na">error</span><span class="p">(</span><span class="s">&quot;driver 异常 x{}: {}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">observationCount</span><span class="p">,</span><span class="w"> </span><span class="n">encodedException</span><span class="p">);</span>
+<span class="p">});</span>
+</code></pre></div>
+
+<p>生产强烈推荐周期性打印。</p>
+<h2 id="158">15.8 一个"简易诊断脚本"</h2>
+<div class="codehilite"><pre><span></span><code><span class="ch">#!/bin/bash</span>
+<span class="nv">DIR</span><span class="o">=</span><span class="k">$(</span>ls<span class="w"> </span>-d<span class="w"> </span>/var/folders/*/aeron-*<span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-1<span class="k">)</span>
+java<span class="w"> </span>-cp<span class="w"> </span>aeron-samples-all.jar<span class="w"> </span>io.aeron.samples.AeronStat<span class="w"> </span><span class="se">\</span>
+<span class="w">     </span>-Daeron.dir<span class="o">=</span><span class="nv">$DIR</span><span class="w"> </span><span class="se">\</span>
+<span class="w">     </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-E<span class="w"> </span><span class="s2">&quot;(back-pressured|Loss|Error|pub-pos|sub-pos)&quot;</span>
+</code></pre></div>
+
+<p>日常巡检就是这个循环。</p>
+<h2 id="159">15.9 常见陷阱</h2>
+<ol>
+<li><strong>cnc.dat 路径错</strong>：AeronStat 一片空白；确认 <code>-Daeron.dir</code> 与 driver 一致。</li>
+<li><strong>counter 值反向减少</strong>：counter 是 volatile long，可能有 wrap，不太可能出现；一般是重启后从 0 开始。</li>
+<li><strong>counter 数量爆炸</strong>：每个 Publisher/Subscriber 都占几个 counter，客户端多起来要预估 <code>counterValuesBufferLength</code>。</li>
+<li><strong>自定义 counter 忘记 close</strong>：counter file 有上限（默认 1000 个），泄漏会耗尽。</li>
+</ol>
+<h2 id="1510">15.10 小结</h2>
+<ul>
+<li>Counters 是 Aeron 生产运维的一等公民；</li>
+<li>学会 AeronStat + Loss Report + Error Log 三件套；</li>
+<li>自定义业务 counter 是最经济的观测手段。</li>
+</ul>
+<nav class="chapter-nav"><a href="ch14-flow-control.html" class="nav-link">← 第 14 章 · 流控、拥塞控制与 Loss Recovery</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch16-multicast.html" class="nav-link next">第 16 章 · UDP Multicast →</a></nav>
+</article>
+<script>
+  // 高亮所有非 mermaid 代码块
+  document.querySelectorAll('pre code:not(.language-mermaid)').forEach(el => {
+    if (window.hljs) hljs.highlightElement(el);
+  });
+</script>
+</body>
+</html>

@@ -7,6 +7,28 @@
 - 掌握 Publication 的生命周期与常见状态；
 - 了解 stream position、term id 等元信息。
 
+## 本章速览
+
+```mermaid
+mindmap
+  root((Publication))
+    两种类型
+      Concurrent::多线程共用
+      Exclusive::单线程独占
+    三种发送
+      offer::最常用, 有拷贝
+      tryClaim::零拷贝, 需 commit
+      向量 offer::多段合并
+    生命周期
+      NotConnected → Connected → Closed
+    元信息
+      position
+      termId
+      sessionId
+```
+
+**一句话**：`ExclusivePublication + tryClaim` 是零拷贝黄金组合；`ConcurrentPublication + offer` 是通用默认。
+
 ## 5.1 两种 Publication
 
 | API | 类型 | 线程安全 | 用途 |
@@ -120,6 +142,40 @@ addPublication ──► not connected ──► connected ──► closed
         (0..N ms)                              │
                                                ▼
                                        (可能变成 not connected：所有 sub 掉线)
+```
+
+**状态机可视化**：
+
+```mermaid
+stateDiagram-v2
+    [*] --> NotConnected: addPublication()
+    NotConnected --> Connected: 有 Subscription 加入
+    Connected --> NotConnected: 所有 Subscription 掉线
+    Connected --> Closed: close()
+    NotConnected --> Closed: close()
+    Closed --> [*]
+
+    note right of NotConnected
+        offer() 返回 -1
+    end note
+    note right of Connected
+        offer() 可能成功或 BACK_PRESSURED
+    end note
+```
+
+## 5.5.1 offer vs tryClaim 数据流对比
+
+```mermaid
+flowchart LR
+    subgraph OFFER["offer 路径（有拷贝）"]
+        BUS1[业务对象] -->|序列化| UB1[UnsafeBuffer]
+        UB1 -->|memcpy| TB1[Term Buffer]
+    end
+    subgraph CLAIM["tryClaim 路径（零拷贝）"]
+        BUS2[业务对象] -->|直接写字段| TB2[Term Buffer]
+    end
+    style OFFER fill:#fde8e8
+    style CLAIM fill:#caffbf
 ```
 
 - 一个 Publication 可以经历多次"connected → not connected → connected"（订阅端来来去去）

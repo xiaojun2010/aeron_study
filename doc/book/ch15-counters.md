@@ -7,6 +7,30 @@
 - 认识常用系统 counter；
 - 能自定义业务 counter 挂到 Aeron 上，一并被工具观察。
 
+## 本章速览：cnc.dat 里到底存什么
+
+```mermaid
+flowchart TB
+    subgraph CNC["cnc.dat（driver 目录下）"]
+        HDR[Header<br/>版本 + buffer 长度]
+        TD[to-driver ring<br/>client → driver 命令]
+        TC[to-clients broadcast<br/>driver → client 事件]
+        CV[counter values buffer<br/>★ 所有 counter 值]
+        CM[counter metadata<br/>counter 名字/标签]
+        EL[error log<br/>异常环形 buffer]
+    end
+    subgraph TOOLS[外部工具]
+        STAT[AeronStat CLI]
+        MON[自研 exporter]
+        ERR[ErrorLogReader]
+    end
+    STAT -->|mmap 读| CV
+    MON -->|mmap 读| CV
+    ERR -->|mmap 读| EL
+    style CV fill:#caffbf
+    style EL fill:#ffd6a5
+```
+
 ## 15.1 Cnc & Counter 概览
 
 driver 目录下 `cnc.dat` 是所有 driver ↔ client 通信的元数据文件。其中一段专门给"counter"用：
@@ -72,6 +96,24 @@ backlog_bytes = pub-pos - min(sub-pos_i)
 ```
 
 监控这个数即可看到"消费者是否跟得上"。IPC 场景 backlog 一旦逼近 term-length，就要注意即将 BackPressure。
+
+**积压可视化**：
+
+```
+term-length = 16 MB, window = 8 MB
+
+pub-pos ─────────────────────┐
+                             ▼
+[═══════════════════════════════════════]  term buffer
+ ▲              ▲                     ▲
+ │              │                     │
+ sub-pos-slow   sub-pos-fast          pub-pos
+ (2 MB)         (10 MB)               (11 MB)
+
+backlog vs 慢消费者 = 9 MB   ← 已超过 window/2, 危险
+backlog vs 快消费者 = 1 MB   ← 健康
+```
+
 
 ## 15.5 CncFileReader（编程方式）
 

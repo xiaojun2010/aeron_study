@@ -52,6 +52,7 @@ public class Demo02SplitPubSub {
         try (MediaDriver mediaDriver = MediaDriver.launchEmbedded();
              Aeron aeron = Aeron.connect(new Aeron.Context()
                      .aeronDirectoryName(mediaDriver.aeronDirectoryName()))) {
+            log.info("mediaDriver.aeronDirectoryName() = {}",mediaDriver.aeronDirectoryName());
 
             // -----------------------------------------------------------------
             // Subscriber 线程

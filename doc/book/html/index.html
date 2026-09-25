@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aeron 从入门到高级：完整学习教程</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-light.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/index.min.js"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose" });
+</script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+                 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2em 1em 4em;
+    background: #fafafa;
+    color: #24292f;
+  }
+  .markdown-body {
+    background: #ffffff;
+    padding: 2.5em 3em;
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+  }
+  .markdown-body pre {
+    background: #f6f8fa !important;
+  }
+  .markdown-body pre.mermaid {
+    background: transparent !important;
+    text-align: center;
+    padding: 1em;
+  }
+  nav.chapter-nav {
+    display: flex;
+    justify-content: space-between;
+    padding: 1em;
+    margin-bottom: 1.5em;
+    background: #eef2f7;
+    border-radius: 8px;
+    font-size: 0.95em;
+  }
+  nav.chapter-nav a {
+    color: #0969da;
+    text-decoration: none;
+  }
+  nav.chapter-nav a:hover { text-decoration: underline; }
+  nav.chapter-nav .nav-link { min-width: 30%; }
+  nav.chapter-nav .nav-link.next { text-align: right; }
+  nav.chapter-nav .nav-link.home { text-align: center; }
+</style>
+</head>
+<body>
+<article class="markdown-body">
+
+<h1 id="aeron">Aeron 从入门到高级：完整学习教程</h1>
+<p>本书是给已经写过 Java（有 Netty/Kafka 使用经验）的工程师准备的 <strong>Aeron 系统性学习手册</strong>。
+一共 25 章，8 大部分，从"最小 Hello World"讲到"生产级低延迟行情总线"。</p>
+<p>配套代码在 <code>/Users/zxj/work/workspace/quant/aeron_study/aeron</code> 的 demo01 ~ demo10；
+本书正文里出现的可运行片段大多可以直接放进对应 demo 包里跑起来。</p>
+<h2 id="_1">阅读建议</h2>
+<ul>
+<li><strong>零基础读者</strong>：先读 <code>../01.aeron 零基础入门.MD</code>，再顺序读本书 Part I~II，配合 demo01~demo05</li>
+<li><strong>有 Kafka 背景</strong>：留意 Ch01 中的语义对比表；不要把 Aeron 当 "更快的 Kafka" 使用</li>
+<li><strong>准备接入行情/交易系统</strong>：Part III + Part VIII 是重点</li>
+<li><strong>需要复制状态机</strong>：Part VII</li>
+</ul>
+<h2 id="_2">目录</h2>
+<h3 id="_3">第一部分 · 基础</h3>
+<ul>
+<li><a href="./ch01-why-aeron.html">第 01 章 · 为什么选择 Aeron？消息模型对比</a></li>
+<li><a href="./ch02-core-concepts.html">第 02 章 · 六个核心概念快览</a></li>
+<li><a href="./ch03-first-program.html">第 03 章 · 环境准备与第一个可运行程序</a></li>
+</ul>
+<h3 id="transport">第二部分 · Transport 基础</h3>
+<ul>
+<li><a href="./ch04-media-driver.html">第 04 章 · MediaDriver：从嵌入式到独立部署</a></li>
+<li><a href="./ch05-publication.html">第 05 章 · Publication 全解</a></li>
+<li><a href="./ch06-subscription.html">第 06 章 · Subscription 与消费模型</a></li>
+<li><a href="./ch07-channel-uri.html">第 07 章 · Channel URI 完全指南</a></li>
+<li><a href="./ch08-offer-backpressure.html">第 08 章 · offer 返回值与 Back Pressure</a></li>
+<li><a href="./ch09-idle-strategy.html">第 09 章 · IdleStrategy 与低延迟循环设计</a></li>
+</ul>
+<h3 id="_4">第三部分 · 编解码与消息</h3>
+<ul>
+<li><a href="./ch10-agrona-buffer.html">第 10 章 · Agrona DirectBuffer 与零 GC 编程</a></li>
+<li><a href="./ch11-fragment-assembler.html">第 11 章 · 大消息与 FragmentAssembler</a></li>
+<li><a href="./ch12-sbe.html">第 12 章 · Simple Binary Encoding（SBE）</a></li>
+</ul>
+<h3 id="_5">第四部分 · 内部机制</h3>
+<ul>
+<li><a href="./ch13-image-term.html">第 13 章 · Image / Session / Term Buffer</a></li>
+<li><a href="./ch14-flow-control.html">第 14 章 · 流控、拥塞控制与 Loss Recovery</a></li>
+<li><a href="./ch15-counters.html">第 15 章 · Counters 与诊断</a></li>
+</ul>
+<h3 id="_6">第五部分 · 高级传输模式</h3>
+<ul>
+<li><a href="./ch16-multicast.html">第 16 章 · UDP Multicast</a></li>
+<li><a href="./ch17-mdc.html">第 17 章 · Multi-Destination Cast（MDC）</a></li>
+<li><a href="./ch18-req-resp.html">第 18 章 · Request / Response 模式</a></li>
+</ul>
+<h3 id="aeron-archive">第六部分 · Aeron Archive</h3>
+<ul>
+<li><a href="./ch19-archive-basics.html">第 19 章 · Archive 概览与录制</a></li>
+<li><a href="./ch20-replay-merge.html">第 20 章 · Replay / Replay-Merge / Live Merge</a></li>
+</ul>
+<h3 id="aeron-cluster">第七部分 · Aeron Cluster</h3>
+<ul>
+<li><a href="./ch21-cluster-overview.html">第 21 章 · Cluster 概述与 Raft</a></li>
+<li><a href="./ch22-clustered-service.html">第 22 章 · 编写一个 Clustered Service</a></li>
+</ul>
+<h3 id="_7">第八部分 · 生产化与实战</h3>
+<ul>
+<li><a href="./ch23-deploy-tuning.html">第 23 章 · 部署、监控、性能调优</a></li>
+<li><a href="./ch24-troubleshooting.html">第 24 章 · 常见错误与排错手册</a></li>
+<li><a href="./ch25-market-bus.html">第 25 章 · 综合案例：低延迟行情总线</a></li>
+</ul>
+<h2 id="_8">参考资料</h2>
+<ul>
+<li>Aeron 官方仓库：<a href="https://github.com/aeron-io/aeron">https://github.com/aeron-io/aeron</a></li>
+<li>官方 Cookbook 代码：<a href="https://github.com/aeron-io/aeron-cookbook-code">https://github.com/aeron-io/aeron-cookbook-code</a></li>
+<li>Aeron 官方文档站：<a href="https://aeron.io/docs/">https://aeron.io/docs/</a></li>
+<li>论文 <em>Mechanical Sympathy</em> 系列（Martin Thompson）</li>
+</ul>
+<h2 id="_9">约定</h2>
+<ul>
+<li>代码块中的 Java 版本 = 21（与本仓库 pom 保持一致）</li>
+<li>Aeron 版本 = 1.44.1（Ch01 会解释这个选择）</li>
+<li>所有示例日志走 log4j2，配置见 <code>aeron/src/main/resources/log4j2.xml</code></li>
+</ul>
+
+</article>
+<script>
+  // 高亮所有非 mermaid 代码块
+  document.querySelectorAll('pre code:not(.language-mermaid)').forEach(el => {
+    if (window.hljs) hljs.highlightElement(el);
+  });
+</script>
+</body>
+</html>

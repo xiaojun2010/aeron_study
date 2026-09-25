@@ -6,6 +6,21 @@
 - 亲手把 demo01 (`Demo01HelloAeron`) 跑起来，看到消息从 Publisher 流到 Subscriber；
 - 知道日志里每个字段的含义。
 
+## 本章速览
+
+```mermaid
+flowchart LR
+    A[① pom.xml<br/>依赖引入] --> B[② log4j2.xml<br/>压噪音]
+    B --> C[③ 写代码<br/>Demo01HelloAeron]
+    C --> D[④ mvn exec:java<br/>看到消息]
+    style A fill:#caffbf
+    style B fill:#caffbf
+    style C fill:#ffd6a5
+    style D fill:#a0c4ff
+```
+
+**四步走**：加依赖 → 配日志 → 写 main → 跑起来。总耗时 5 分钟。
+
 ## 3.1 依赖清单
 
 `pom.xml`：
@@ -65,6 +80,27 @@ Aeron 内部用 `java.util.logging`，跑起来会打很多东西。用 log4j2 �
 ```
 
 ## 3.3 最小可运行示例
+
+**8 步走通全流程**：
+
+```mermaid
+flowchart TD
+    A[Step 1<br/>MediaDriver.launchEmbedded] --> B[Step 2<br/>Aeron.connect]
+    B --> C[Step 3<br/>addPublication]
+    B --> D[Step 4<br/>addSubscription]
+    C --> E[Step 5<br/>等 isConnected]
+    D --> E
+    E --> F[Step 6<br/>UnsafeBuffer 装消息]
+    F --> G[Step 7<br/>offer 发送]
+    G --> H[Step 8<br/>poll 接收+回调]
+    H --> I{还有消息?}
+    I -->|是| G
+    I -->|否| J[close 释放]
+    style A fill:#ffd6a5
+    style G fill:#caffbf
+    style H fill:#a0c4ff
+```
+
 
 参见配套代码 `aeron/src/main/java/org/example/demo01/Demo01HelloAeron.java`。核心 4 步：
 
@@ -135,6 +171,20 @@ aeron-zxj-1234/
 ├── publications/          发布端 term buffer 文件
 ├── images/                Subscription 侧的重组镜像
 └── loss-report.dat        丢失报告（Ch14 用）
+```
+
+**结构可视化**：
+
+```mermaid
+flowchart TD
+    ROOT["aeron-zxj-1234/<br/>（driver 目录 = 所有客户端约定的会合点）"]
+    ROOT --> CNC["cnc.dat<br/>元数据、counter、error log<br/>~1 MB"]
+    ROOT --> PUB["publications/<br/>每个 Publisher 一个文件<br/>~48 MB (3×term)"]
+    ROOT --> IMG["images/<br/>Subscriber 的接收镜像"]
+    ROOT --> LOSS["loss-report.dat<br/>UDP 丢包记录"]
+    style CNC fill:#ffd6a5
+    style PUB fill:#caffbf
+    style IMG fill:#a0c4ff
 ```
 
 - 独立部署 MediaDriver 时（demo03）会使用固定目录 `${TMPDIR}/aeron-${user}`

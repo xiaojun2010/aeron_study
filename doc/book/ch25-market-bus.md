@@ -6,6 +6,62 @@
 - 学习端到端的低延迟系统组织方式：Netty ↔ Aeron ↔ Business ↔ Archive；
 - 拿到一份可以直接改造为生产版本的骨架。
 
+## 本章速览：4 步演进路线
+
+```mermaid
+flowchart LR
+    P1["Phase 1<br/>单机 IPC<br/>demo10 起步"] --> P2["Phase 2<br/>独立 JVM<br/>driver 常驻"]
+    P2 --> P3["Phase 3<br/>跨机 MDC<br/>多节点广播"]
+    P3 --> P4["Phase 4<br/>Cluster<br/>Raft 强一致"]
+
+    style P1 fill:#caffbf
+    style P2 fill:#fdffb6
+    style P3 fill:#ffd6a5
+    style P4 fill:#a0c4ff
+```
+
+**目标架构（Phase 4）**：
+
+```mermaid
+flowchart TB
+    subgraph EX["交易所（互联网）"]
+        BN[Binance WS]
+        BY[Bybit WS]
+        GT[Gate WS]
+    end
+
+    subgraph GW["Gateway 层（Netty）"]
+        COL[MarketCollector<br/>归一化, SBE encode]
+    end
+
+    subgraph BUS["Aeron 总线"]
+        MD[MediaDriver<br/>IPC or MDC]
+        AR[Archive Recorder]
+    end
+
+    subgraph BIZ["业务层"]
+        STR[Strategy Engine]
+        RSK[Risk Engine]
+        REC[Recorder Backup]
+    end
+
+    BN --> COL
+    BY --> COL
+    GT --> COL
+    COL -->|Aeron Publication<br/>tryClaim + SBE| MD
+    MD --> STR
+    MD --> RSK
+    MD --> REC
+    MD --> AR
+    AR --> DISK[(SSD Archive)]
+
+    style COL fill:#a0c4ff
+    style MD fill:#caffbf
+    style STR fill:#fdffb6
+    style RSK fill:#fdffb6
+    style AR fill:#ffd6a5
+```
+
 ## 25.1 目标系统
 
 ```

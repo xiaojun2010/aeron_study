@@ -7,6 +7,45 @@
 - 掌握 `idle(work)` 模式，避免"忙等 100% CPU"和"睡太久漏消息"两个极端；
 - 了解 driver 内部 IdleStrategy 的配置方式。
 
+## 本章速览：延迟 vs CPU 的取舍谱
+
+```
+   延迟低               CPU 高
+   ─────────────────────────▶
+   NoOp / BusySpin      Yielding    Backoff       Sleeping
+     │                    │           │              │
+   100% CPU            100% CPU    自适应         低 CPU
+   亚微秒              μs 级       混合           ms 级延迟
+   适合绑核            适合竞争    ★生产默认      适合后台
+
+   ◀─────────────────────────
+   CPU 高                延迟高
+```
+
+```mermaid
+flowchart TD
+    START[消费循环<br/>while running] --> POLL[poll]
+    POLL --> W{work?}
+    W -->|>0 有消息| RESET[reset 策略<br/>回到激进]
+    W -->|=0 没消息| IDLE[idle 让 CPU]
+    IDLE --> DECIDE{策略类型}
+    DECIDE -->|NoOp| N1[什么也不做]
+    DECIDE -->|BusySpin| N2[Thread.onSpinWait]
+    DECIDE -->|Yielding| N3[Thread.yield]
+    DECIDE -->|Sleeping| N4[parkNanos]
+    DECIDE -->|Backoff| N5[逐级退让]
+    N5 --> LEVELS[spin → yield → park 1μs → 2μs → ... → 100μs]
+    RESET --> POLL
+    N1 --> POLL
+    N2 --> POLL
+    N3 --> POLL
+    N4 --> POLL
+    LEVELS --> POLL
+    style RESET fill:#caffbf
+    style N5 fill:#a0c4ff
+    style LEVELS fill:#fdffb6
+```
+
 ## 9.1 Aeron 消费循环的骨架
 
 ```java

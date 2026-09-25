@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 16 章 · UDP Multicast</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-light.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/index.min.js"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose" });
+</script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+                 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2em 1em 4em;
+    background: #fafafa;
+    color: #24292f;
+  }
+  .markdown-body {
+    background: #ffffff;
+    padding: 2.5em 3em;
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+  }
+  .markdown-body pre {
+    background: #f6f8fa !important;
+  }
+  .markdown-body pre.mermaid {
+    background: transparent !important;
+    text-align: center;
+    padding: 1em;
+  }
+  nav.chapter-nav {
+    display: flex;
+    justify-content: space-between;
+    padding: 1em;
+    margin-bottom: 1.5em;
+    background: #eef2f7;
+    border-radius: 8px;
+    font-size: 0.95em;
+  }
+  nav.chapter-nav a {
+    color: #0969da;
+    text-decoration: none;
+  }
+  nav.chapter-nav a:hover { text-decoration: underline; }
+  nav.chapter-nav .nav-link { min-width: 30%; }
+  nav.chapter-nav .nav-link.next { text-align: right; }
+  nav.chapter-nav .nav-link.home { text-align: center; }
+</style>
+</head>
+<body>
+<article class="markdown-body">
+<nav class="chapter-nav"><a href="ch15-counters.html" class="nav-link">← 第 15 章 · Counters 与诊断</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch17-mdc.html" class="nav-link next">第 17 章 · Multi-Destination Cast（MDC） →</a></nav>
+<h1 id="16-udp-multicast">第 16 章 · UDP Multicast</h1>
+<h2 id="_1">学习目标</h2>
+<ul>
+<li>理解 UDP 组播的核心地址范围与 TTL；</li>
+<li>会写 Aeron 组播 URI；</li>
+<li>知道 IGMP、<code>interface</code> 参数的用途；</li>
+<li>明白组播 flow control 的独特性。</li>
+</ul>
+<h2 id="vs-vs-mdc">本章速览：组播 vs 单播 vs MDC</h2>
+<pre class="mermaid">
+flowchart LR
+    subgraph U["单播 (Unicast) - N 份"]
+        UP[Publisher] --> US1[Sub A]
+        UP --> US2[Sub B]
+        UP --> US3[Sub C]
+    end
+    subgraph M["组播 (Multicast) - 1 份"]
+        MP[Publisher] --> MG((组播地址<br/>239.x.y.z))
+        MG --> MS1[Sub A]
+        MG --> MS2[Sub B]
+        MG --> MS3[Sub C]
+    end
+    subgraph D["MDC - N 份但 API 单发"]
+        DP[Publisher<br/>单次 offer] --> DE[MediaDriver<br/>fan-out N 个 UDP]
+        DE --> DS1[Sub A]
+        DE --> DS2[Sub B]
+        DE --> DS3[Sub C]
+    end
+    style M fill:#caffbf
+    style D fill:#a0c4ff
+</pre>
+
+<p><strong>记忆</strong>：组播 = 一次 offer，一份 UDP 出去（交换机复制）；MDC = 一次 offer，N 份 UDP 出去（driver 复制）。</p>
+<h2 id="161">16.1 何时使用组播</h2>
+<p>一发多收、订阅方数量不确定或经常变动 → 组播。典型场景：
+- 行情分发（1 个 gateway → N 个策略/风控/录制）
+- 服务发现广播
+- 集群心跳</p>
+<p>不用组播的场景：
+- 云环境（AWS/GCP 默认不支持）
+- 订阅方 &lt;= 3 且稳定 → 直接多个单播更简单
+- 需要跨路由器 → 需运维配 IGMP snooping / PIM</p>
+<h2 id="162-ip">16.2 IP 组播地址范围</h2>
+<table>
+<thead>
+<tr>
+<th>范围</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>224.0.0.0 ~ 224.0.0.255</td>
+<td>本地网段（TTL=1）</td>
+</tr>
+<tr>
+<td>224.0.1.0 ~ 238.255.255.255</td>
+<td>全网组播</td>
+</tr>
+<tr>
+<td><strong>239.0.0.0 ~ 239.255.255.255</strong></td>
+<td>管理域组播（推荐生产用）</td>
+</tr>
+</tbody>
+</table>
+<p><strong>建议自研系统选 239.x.y.z 段</strong>，避免与知名协议冲突。</p>
+<h2 id="163-aeron-uri">16.3 Aeron 组播 URI</h2>
+<div class="codehilite"><pre><span></span><code>aeron:udp?endpoint=239.1.2.3:40456|interface=eth0
+</code></pre></div>
+
+<ul>
+<li><code>endpoint</code>：组播 IP + 端口</li>
+<li><code>interface</code>：本机使用的网卡地址（多网卡机器必须显式指定）</li>
+<li><code>ttl</code>：TTL，默认 0（本机），要跨路由器改成 8+</li>
+</ul>
+<p>同一 (group, port) 上所有订阅方都会收到相同数据。</p>
+<h2 id="164">16.4 一个可运行示例</h2>
+<p>Publisher：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">String</span><span class="w"> </span><span class="n">channel</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">&quot;aeron:udp?endpoint=239.1.2.3:40456|ttl=1&quot;</span><span class="p">;</span>
+<span class="n">Publication</span><span class="w"> </span><span class="n">pub</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">aeron</span><span class="p">.</span><span class="na">addPublication</span><span class="p">(</span><span class="n">channel</span><span class="p">,</span><span class="w"> </span><span class="mi">1001</span><span class="p">);</span>
+</code></pre></div>
+
+<p>Subscriber（可以起 N 个进程，全部收到）：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">String</span><span class="w"> </span><span class="n">channel</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">&quot;aeron:udp?endpoint=239.1.2.3:40456&quot;</span><span class="p">;</span>
+<span class="n">Subscription</span><span class="w"> </span><span class="n">sub</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">aeron</span><span class="p">.</span><span class="na">addSubscription</span><span class="p">(</span><span class="n">channel</span><span class="p">,</span><span class="w"> </span><span class="mi">1001</span><span class="p">);</span>
+</code></pre></div>
+
+<p>Linux 上先确保系统允许组播：</p>
+<div class="codehilite"><pre><span></span><code>sudo<span class="w"> </span>sysctl<span class="w"> </span>-w<span class="w"> </span>net.ipv4.conf.all.mc_forwarding<span class="o">=</span><span class="m">1</span>
+sudo<span class="w"> </span>ip<span class="w"> </span>route<span class="w"> </span>add<span class="w"> </span><span class="m">239</span>.0.0.0/8<span class="w"> </span>dev<span class="w"> </span>eth0
+</code></pre></div>
+
+<p>macOS 通常本机测试直接可用。</p>
+<h2 id="165-interface">16.5 interface 参数细节</h2>
+<p>多网卡机器（比如生产服务器 mgmt + trade 两块网卡）：</p>
+<div class="codehilite"><pre><span></span><code>aeron:udp?endpoint=239.1.2.3:40456|interface=10.0.0.10
+aeron:udp?endpoint=239.1.2.3:40456|interface=10.0.0.10/24     # 用 CIDR 匹配
+</code></pre></div>
+
+<p><code>interface</code> 的作用：
+- Publisher：出口选哪张网卡；
+- Subscriber：加入组播组时用哪张网卡（否则可能加错）。</p>
+<h2 id="166-flow-control-ch14">16.6 组播 flow control（复习 Ch14）</h2>
+<p>组播的独特问题：Publisher 只有一份，但 Subscriber 一群，谁慢谁快都可能。</p>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>语义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>fc=min</code></td>
+<td>Publisher 跟着最慢订阅方</td>
+</tr>
+<tr>
+<td><code>fc=max</code></td>
+<td>Publisher 跟着最快，慢订阅方掉队</td>
+</tr>
+<tr>
+<td><code>fc=tagged,g:0/1</code></td>
+<td>只看 gtag=1 的订阅方</td>
+</tr>
+</tbody>
+</table>
+<p>生产上 <strong>行情分发</strong> 常用 <code>fc=max</code> + 大 term-length（丢的订阅方通过 Archive replay 补回来）。</p>
+<h2 id="167-igmp-snooping">16.7 IGMP snooping</h2>
+<p>如果不设 IGMP snooping，交换机会把组播包广播给整个 VLAN，噪音很大。运维需要：</p>
+<div class="codehilite"><pre><span></span><code>switch(config)# ip igmp snooping vlan 100
+</code></pre></div>
+
+<p>Java 侧不用改代码，只是交换机层面的配置。</p>
+<h2 id="168">16.8 连接性诊断</h2>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 网卡是否加入组</span>
+netstat<span class="w"> </span>-g
+
+<span class="c1"># 2. 是否收到组播</span>
+tcpdump<span class="w"> </span>-i<span class="w"> </span>eth0<span class="w"> </span>-n<span class="w"> </span>dst<span class="w"> </span><span class="m">239</span>.1.2.3
+
+<span class="c1"># 3. TTL 是否够</span>
+ttl<span class="w"> </span>一定要<span class="w"> </span>&gt;<span class="o">=</span><span class="w"> </span>跨的路由器数量
+</code></pre></div>
+
+<h2 id="169">16.9 常见陷阱</h2>
+<ol>
+<li><strong>组播地址端口撞车</strong>：不同业务用了相同 (group, port)，串包。</li>
+<li><strong>多网卡默认路由错</strong>：Publisher 发到 mgmt 网卡了，Subscriber 在 trade 网卡看不到。</li>
+<li><strong>TTL=0 想跨机</strong>：0 只在本机，1 只在本网段，要加。</li>
+<li><strong>云上跑组播</strong>：多数公有云不支持，除非用专线或者 overlay。</li>
+<li><strong>fc=max 但没有配 Archive 补丢</strong>：慢订阅方永远丢数据。</li>
+</ol>
+<h2 id="1610">16.10 小结</h2>
+<ul>
+<li>组播 URI 三要素：<code>endpoint=239.x|interface=xxx|ttl=N</code></li>
+<li>组播 flow control 一定要主动选（min / max / tagged）</li>
+<li>组播不是通用方案，云上首选 MDC（Ch17）</li>
+</ul>
+<nav class="chapter-nav"><a href="ch15-counters.html" class="nav-link">← 第 15 章 · Counters 与诊断</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch17-mdc.html" class="nav-link next">第 17 章 · Multi-Destination Cast（MDC） →</a></nav>
+</article>
+<script>
+  // 高亮所有非 mermaid 代码块
+  document.querySelectorAll('pre code:not(.language-mermaid)').forEach(el => {
+    if (window.hljs) hljs.highlightElement(el);
+  });
+</script>
+</body>
+</html>

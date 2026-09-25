@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 14 章 · 流控、拥塞控制与 Loss Recovery</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-light.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/index.min.js"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose" });
+</script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+                 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2em 1em 4em;
+    background: #fafafa;
+    color: #24292f;
+  }
+  .markdown-body {
+    background: #ffffff;
+    padding: 2.5em 3em;
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+  }
+  .markdown-body pre {
+    background: #f6f8fa !important;
+  }
+  .markdown-body pre.mermaid {
+    background: transparent !important;
+    text-align: center;
+    padding: 1em;
+  }
+  nav.chapter-nav {
+    display: flex;
+    justify-content: space-between;
+    padding: 1em;
+    margin-bottom: 1.5em;
+    background: #eef2f7;
+    border-radius: 8px;
+    font-size: 0.95em;
+  }
+  nav.chapter-nav a {
+    color: #0969da;
+    text-decoration: none;
+  }
+  nav.chapter-nav a:hover { text-decoration: underline; }
+  nav.chapter-nav .nav-link { min-width: 30%; }
+  nav.chapter-nav .nav-link.next { text-align: right; }
+  nav.chapter-nav .nav-link.home { text-align: center; }
+</style>
+</head>
+<body>
+<article class="markdown-body">
+<nav class="chapter-nav"><a href="ch13-image-term.html" class="nav-link">← 第 13 章 · Image / Session / Term Buffer</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch15-counters.html" class="nav-link next">第 15 章 · Counters 与诊断 →</a></nav>
+<h1 id="14-loss-recovery">第 14 章 · 流控、拥塞控制与 Loss Recovery</h1>
+<h2 id="_1">学习目标</h2>
+<ul>
+<li>理解 Aeron 的流控模型（sender-based）；</li>
+<li>认清"Flow Control"、"Congestion Control"、"Loss Recovery"三层的分工；</li>
+<li>会为不同订阅拓扑选择合适的 flow control 策略；</li>
+<li>知道丢包时的重传机制以及 NAK。</li>
+</ul>
+<h2 id="_2">本章速览：三层控制职责</h2>
+<pre class="mermaid">
+flowchart TB
+    APP[业务层<br/>决定 BackPressure 时怎么办<br/>等/丢/合并/降采样]
+    FC[Aeron 流控<br/>根据 SM 算 publisherLimit<br/>fc=min/max/tagged]
+    CC[拥塞控制<br/>StaticWindow / Cubic<br/>探测网络能吃多少]
+    LR[丢包重传<br/>NAK + term buffer 回溯<br/>subscriber 主动要]
+
+    APP --> FC
+    FC --> CC
+    CC --> LR
+
+    style APP fill:#ffd6a5
+    style FC fill:#fdffb6
+    style CC fill:#caffbf
+    style LR fill:#a0c4ff
+</pre>
+
+<p><strong>记忆</strong>：三层像高速公路的三种规则——你自己控制车速（业务）+ 交通信号（流控）+ 匝道拥堵调度（拥塞）+ 追尾后拖车重新走（丢包重传）。</p>
+<h2 id="141">14.1 三层控制</h2>
+<div class="codehilite"><pre><span></span><code>应用层        Business decision on BACK_PRESSURED       ← Ch08
+─────────────────────────────────────────────────────
+Aeron 流控    Publisher 侧根据订阅 position 决定发多少   ← 本章
+             （Flow Control Strategy）
+─────────────────────────────────────────────────────
+UDP 拥塞控制  防止把网络打死（Congestion Control）        ← 本章
+─────────────────────────────────────────────────────
+UDP 丢包重传  NAK-based, term buffer 内可回溯           ← 本章
+</code></pre></div>
+
+<h2 id="142-ipc">14.2 IPC 流控</h2>
+<p>IPC 场景没有网络拥塞，也不会真"丢"消息。流控完全基于 term buffer 空间：</p>
+<div class="codehilite"><pre><span></span><code>publisherLimit = min(consumerPositions) + termWindowLength
+</code></pre></div>
+
+<ul>
+<li><code>termWindowLength</code> = term-length / 2（默认）</li>
+<li>Publisher 超过 limit 就 BACK_PRESSURED</li>
+</ul>
+<p>调整方式：加大 term-length，或者优化 consumer。</p>
+<h2 id="143-udp">14.3 UDP 流控策略</h2>
+<p>Subscriber 会定期发 <strong>Status Message (SM)</strong> 给 Publisher，报告自己的 consumer position。Publisher 根据所有已知 SM 计算 publisherLimit。</p>
+<p>多个 Subscriber 的场景，Aeron 提供不同"合并策略"：</p>
+<table>
+<thead>
+<tr>
+<th>策略类</th>
+<th>语义</th>
+<th>场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>MinMulticastFlowControl</code></td>
+<td>采用 <strong>最慢</strong> 订阅者的 position</td>
+<td>保证不丢：所有订阅者都要跟上</td>
+</tr>
+<tr>
+<td><code>MaxMulticastFlowControl</code></td>
+<td>采用 <strong>最快</strong> 订阅者的 position</td>
+<td>慢订阅者会掉队（丢消息）</td>
+</tr>
+<tr>
+<td><code>PreferredMulticastFlowControl</code></td>
+<td>只关心 tag 匹配的订阅者</td>
+<td>有主备订阅者时</td>
+</tr>
+<tr>
+<td><code>DefaultUnicastFlowControl</code></td>
+<td>单播默认</td>
+<td>单个订阅方</td>
+</tr>
+</tbody>
+</table>
+<p>配置：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">MediaDriver</span><span class="p">.</span><span class="na">Context</span><span class="w"> </span><span class="n">ctx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">MediaDriver</span><span class="p">.</span><span class="na">Context</span><span class="p">()</span>
+<span class="w">    </span><span class="p">.</span><span class="na">multicastFlowControlSupplier</span><span class="p">(</span><span class="k">new</span><span class="w"> </span><span class="n">MinMulticastFlowControlSupplier</span><span class="p">());</span>
+</code></pre></div>
+
+<p>或者按 channel 指定：</p>
+<div class="codehilite"><pre><span></span><code>aeron:udp?endpoint=224.0.0.1:40456|fc=min                    # min
+aeron:udp?endpoint=224.0.0.1:40456|fc=max                    # max
+aeron:udp?endpoint=224.0.0.1:40456|fc=tagged,g:0/1           # tagged
+</code></pre></div>
+
+<h2 id="144">14.4 拥塞控制</h2>
+<p>Aeron 的拥塞控制发生在 sender：如果检测到丢包/慢确认，会主动降速（类似 TCP CUBIC）。可选：</p>
+<ul>
+<li><code>StaticWindowCongestionControl</code>（默认，简单）：固定 window</li>
+<li><code>CubicCongestionControl</code>：TCP CUBIC 曲线，适合共享网络</li>
+</ul>
+<div class="codehilite"><pre><span></span><code><span class="n">ctx</span><span class="p">.</span><span class="na">congestionControlSupplier</span><span class="p">(</span><span class="k">new</span><span class="w"> </span><span class="n">CubicCongestionControlSupplier</span><span class="p">());</span>
+</code></pre></div>
+
+<h2 id="145-loss-recoverynak">14.5 Loss Recovery：NAK</h2>
+<p>Aeron 用 <strong>NAK (Negative ACK)</strong> 机制而不是 TCP 的 ACK：</p>
+<ul>
+<li>Subscriber 发 SM 告诉 Publisher"我已经 poll 到 pos X"；</li>
+<li>如果 Subscriber 检测到 gap（比如收到 pos=10 但 pos=8~9 没收到），发 <strong>NAK</strong>；</li>
+<li>Publisher 侧 term buffer <strong>还没被覆盖</strong> → 重传丢失字节；</li>
+<li>覆盖了 → subscriber 记 Loss，见 <code>loss-report.dat</code>。</li>
+</ul>
+<p>因此：<strong>term buffer 越大，能容忍的丢包时间窗口越长</strong>。</p>
+<p><strong>NAK 时序示例</strong>：</p>
+<pre class="mermaid">
+sequenceDiagram
+    participant P as Publisher
+    participant N as 网络
+    participant S as Subscriber
+
+    P->>N: pos=8
+    P->>N: pos=9
+    Note over N: pos=9 丢了
+    P->>N: pos=10
+    N->>S: pos=8
+    N->>S: pos=10
+    Note over S: 检测到 gap: 缺 pos=9
+    S->>P: NAK(9)
+    P->>N: 重传 pos=9
+    N->>S: pos=9
+    Note over S: 补齐, 顺序交付业务
+</pre>
+
+<p><strong>关键点</strong>：只有 Publisher 的 term buffer 还没覆盖 pos=9 时，重传才成功；否则记入 loss-report。</p>
+<h2 id="146-loss-report">14.6 Loss Report</h2>
+<p>driver 目录下 <code>loss-report.dat</code> 是所有丢包事件的记录：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">LossReportReader</span><span class="p">.</span><span class="na">read</span><span class="p">(</span><span class="n">mmapBuffer</span><span class="p">,</span><span class="w"> </span><span class="p">(</span><span class="n">observationCount</span><span class="p">,</span><span class="w"> </span><span class="n">totalBytesLost</span><span class="p">,</span><span class="w"> </span><span class="n">firstObservationTs</span><span class="p">,</span><span class="w"> </span><span class="n">lastObservationTs</span><span class="p">,</span>
+<span class="w">                                    </span><span class="n">sessionId</span><span class="p">,</span><span class="w"> </span><span class="n">streamId</span><span class="p">,</span><span class="w"> </span><span class="n">channel</span><span class="p">,</span><span class="w"> </span><span class="n">source</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">log</span><span class="p">.</span><span class="na">warn</span><span class="p">(</span><span class="s">&quot;丢失 {} 次, {} 字节, channel={}, session={}&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="n">observationCount</span><span class="p">,</span><span class="w"> </span><span class="n">totalBytesLost</span><span class="p">,</span><span class="w"> </span><span class="n">channel</span><span class="p">,</span><span class="w"> </span><span class="n">sessionId</span><span class="p">);</span>
+<span class="p">});</span>
+</code></pre></div>
+
+<p>线上必须监控。</p>
+<h2 id="147-publisher-unblock">14.7 Publisher UnBlock</h2>
+<p>如果 Publisher 卡住太久（BackPressure 超过 <code>publicationUnblockTimeoutNs</code>，默认 15 s），driver 会强制 unblock（丢弃当前写入位置的消息），避免死锁。</p>
+<p>排查思路：
+- Publisher 长时间 UnBlock → 消费者跟不上 or 掉线
+- 加监控：<code>system_publication_unblock</code> counter</p>
+<h2 id="148-sm">14.8 SM 频率</h2>
+<p>Subscriber 发 SM 的频率影响流控精度：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">ctx</span><span class="p">.</span><span class="na">statusMessageTimeoutNs</span><span class="p">(</span><span class="n">TimeUnit</span><span class="p">.</span><span class="na">MILLISECONDS</span><span class="p">.</span><span class="na">toNanos</span><span class="p">(</span><span class="mi">200</span><span class="p">));</span><span class="w">   </span><span class="c1">// 默认 200 ms</span>
+</code></pre></div>
+
+<p>高频交易场景建议调短到 10~50 ms，让 Publisher 更快感知消费速度。</p>
+<h2 id="149">14.9 一个"下游主备"的场景</h2>
+<p>假设有两个订阅者，主用要 100% 保证不丢，备用可以慢：</p>
+<p>方案 A：用两个 channel，主用走 <code>fc=min</code>（保证 preferred sub），备用走另一个 channel + 大 term
+方案 B：<code>fc=tagged</code>，给主用打上 tag：</p>
+<div class="codehilite"><pre><span></span><code>Publisher: aeron:udp?endpoint=...|fc=tagged,g:0/1
+主 Sub   : aeron:udp?endpoint=...|gtag=1
+备 Sub   : aeron:udp?endpoint=...
+</code></pre></div>
+
+<p>流控只看 gtag=1 的订阅者。</p>
+<h2 id="1410">14.10 常见陷阱</h2>
+<ol>
+<li><strong>多播用 min 但备份订阅者很慢</strong>：Publisher 被拖慢，加 tagged 或分流。</li>
+<li><strong>term 太小</strong>：丢包重传窗口太短，<code>loss-report</code> 满地。</li>
+<li><strong>SM 间隔太长</strong>：流控不及时，BackPressure 突发。</li>
+<li><strong>忘看 loss-report</strong>：默默丢数据。</li>
+</ol>
+<h2 id="1411">14.11 小结</h2>
+<ul>
+<li>Aeron 流控是"sender pull"模型：SM 是核心信号；</li>
+<li>Multicast 场景要选对 <code>fc=</code> 策略；</li>
+<li>NAK + term buffer 提供"应用无感知"的丢包重传；</li>
+<li>Loss Report 必须监控。</li>
+</ul>
+<nav class="chapter-nav"><a href="ch13-image-term.html" class="nav-link">← 第 13 章 · Image / Session / Term Buffer</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch15-counters.html" class="nav-link next">第 15 章 · Counters 与诊断 →</a></nav>
+</article>
+<script>
+  // 高亮所有非 mermaid 代码块
+  document.querySelectorAll('pre code:not(.language-mermaid)').forEach(el => {
+    if (window.hljs) hljs.highlightElement(el);
+  });
+</script>
+</body>
+</html>

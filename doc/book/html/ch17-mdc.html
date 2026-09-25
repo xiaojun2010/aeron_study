@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 17 章 · Multi-Destination Cast（MDC）</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-light.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/index.min.js"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose" });
+</script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+                 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2em 1em 4em;
+    background: #fafafa;
+    color: #24292f;
+  }
+  .markdown-body {
+    background: #ffffff;
+    padding: 2.5em 3em;
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+  }
+  .markdown-body pre {
+    background: #f6f8fa !important;
+  }
+  .markdown-body pre.mermaid {
+    background: transparent !important;
+    text-align: center;
+    padding: 1em;
+  }
+  nav.chapter-nav {
+    display: flex;
+    justify-content: space-between;
+    padding: 1em;
+    margin-bottom: 1.5em;
+    background: #eef2f7;
+    border-radius: 8px;
+    font-size: 0.95em;
+  }
+  nav.chapter-nav a {
+    color: #0969da;
+    text-decoration: none;
+  }
+  nav.chapter-nav a:hover { text-decoration: underline; }
+  nav.chapter-nav .nav-link { min-width: 30%; }
+  nav.chapter-nav .nav-link.next { text-align: right; }
+  nav.chapter-nav .nav-link.home { text-align: center; }
+</style>
+</head>
+<body>
+<article class="markdown-body">
+<nav class="chapter-nav"><a href="ch16-multicast.html" class="nav-link">← 第 16 章 · UDP Multicast</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch18-req-resp.html" class="nav-link next">第 18 章 · Request / Response 模式 →</a></nav>
+<h1 id="17-multi-destination-castmdc">第 17 章 · Multi-Destination Cast（MDC）</h1>
+<h2 id="_1">学习目标</h2>
+<ul>
+<li>理解 Aeron MDC 的定位：单点发布 → 多点单播；</li>
+<li>学会 manual / dynamic 两种 MDC 模式的配置；</li>
+<li>会画 MDC 的 wire diagram；</li>
+<li>明白 MDC 与组播的取舍。</li>
+</ul>
+<h2 id="manual-vs-dynamic">本章速览：manual vs dynamic</h2>
+<pre class="mermaid">
+flowchart LR
+    subgraph MAN["Manual MDC（严控名单）"]
+        MP[Publisher] --> MA[destination A]
+        MP --> MB[destination B]
+        MP --> MC[destination C]
+        CONF[配置系统<br/>addDestination] -.管理.-> MP
+    end
+    subgraph DYN["Dynamic MDC（订阅方自助）"]
+        DP[Publisher<br/>开 control endpoint]
+        DS1[Sub A] -.主动注册.-> DP
+        DS2[Sub B] -.主动注册.-> DP
+        DS3[Sub C] -.主动注册.-> DP
+        DP --> DS1
+        DP --> DS2
+        DP --> DS3
+    end
+    style MAN fill:#fef3c7
+    style DYN fill:#caffbf
+</pre>
+
+<p><strong>选择</strong>：内部审计场景选 manual；行情/公开广播场景选 dynamic。</p>
+<h2 id="171-mdc">17.1 MDC 是什么</h2>
+<p><strong>Multi-Destination Cast</strong> = "Publisher 一份数据，发到 N 个单播目的地"。</p>
+<div class="codehilite"><pre><span></span><code>                ┌──────▶ Sub A (unicast)
+Publisher ─────┼──────▶ Sub B (unicast)
+                └──────▶ Sub C (unicast)
+</code></pre></div>
+
+<p>从订阅方看，就是普通的 unicast；从 Publisher 侧看，driver 内部把同一份数据发给多个目的地。</p>
+<h2 id="172">17.2 与组播的对比</h2>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>Multicast</th>
+<th>MDC</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>网络支持</td>
+<td>需要 IGMP / 路由</td>
+<td>走普通 UDP</td>
+</tr>
+<tr>
+<td>云环境</td>
+<td>大多不支持</td>
+<td>✔ 完全兼容</td>
+</tr>
+<tr>
+<td>订阅方数量</td>
+<td>无上限（交换机限制）</td>
+<td>~几十到上百</td>
+</tr>
+<tr>
+<td>每包成本</td>
+<td>1 个 UDP 包</td>
+<td>N 个 UDP 包（每个目的地一份）</td>
+</tr>
+<tr>
+<td>Flow control</td>
+<td>组播 fc 策略</td>
+<td>独立单播流控</td>
+</tr>
+<tr>
+<td>适合</td>
+<td>LAN 大规模广播</td>
+<td>云上 / 少量订阅方 / 跨路由</td>
+</tr>
+</tbody>
+</table>
+<h2 id="173-mdc">17.3 两种 MDC 模式</h2>
+<h3 id="1731-manual-mdc">17.3.1 Manual MDC</h3>
+<p>Publisher 侧写死目的地列表（订阅方不会自动加入）：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">String</span><span class="w"> </span><span class="n">channel</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">&quot;aeron:udp?control-mode=manual&quot;</span><span class="p">;</span>
+<span class="n">Publication</span><span class="w"> </span><span class="n">pub</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">aeron</span><span class="p">.</span><span class="na">addPublication</span><span class="p">(</span><span class="n">channel</span><span class="p">,</span><span class="w"> </span><span class="mi">1001</span><span class="p">);</span>
+
+<span class="c1">// 手动加目的地</span>
+<span class="n">pub</span><span class="p">.</span><span class="na">addDestination</span><span class="p">(</span><span class="s">&quot;aeron:udp?endpoint=10.0.0.10:40456&quot;</span><span class="p">);</span>
+<span class="n">pub</span><span class="p">.</span><span class="na">addDestination</span><span class="p">(</span><span class="s">&quot;aeron:udp?endpoint=10.0.0.11:40456&quot;</span><span class="p">);</span>
+
+<span class="c1">// 也可以运行时删</span>
+<span class="n">pub</span><span class="p">.</span><span class="na">removeDestination</span><span class="p">(</span><span class="s">&quot;aeron:udp?endpoint=10.0.0.10:40456&quot;</span><span class="p">);</span>
+</code></pre></div>
+
+<p>用于严格控制订阅列表的场景。</p>
+<h3 id="1732-dynamic-mdc">17.3.2 Dynamic MDC</h3>
+<p>Publisher 开一个 <strong>control endpoint</strong>，Subscriber 主动来注册：</p>
+<p>Publisher：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">String</span><span class="w"> </span><span class="n">channel</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">&quot;aeron:udp?control=10.0.0.5:41000|control-mode=dynamic&quot;</span><span class="p">;</span>
+<span class="n">Publication</span><span class="w"> </span><span class="n">pub</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">aeron</span><span class="p">.</span><span class="na">addPublication</span><span class="p">(</span><span class="n">channel</span><span class="p">,</span><span class="w"> </span><span class="mi">1001</span><span class="p">);</span>
+</code></pre></div>
+
+<p>Subscriber：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">String</span><span class="w"> </span><span class="n">channel</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">&quot;aeron:udp?endpoint=10.0.0.10:40456|control=10.0.0.5:41000&quot;</span><span class="p">;</span>
+<span class="n">Subscription</span><span class="w"> </span><span class="n">sub</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">aeron</span><span class="p">.</span><span class="na">addSubscription</span><span class="p">(</span><span class="n">channel</span><span class="p">,</span><span class="w"> </span><span class="mi">1001</span><span class="p">);</span>
+</code></pre></div>
+
+<p>Aeron 内部会：
+1. Subscriber 联系 control endpoint；
+2. Publisher 把 subscriber 的 endpoint 加入目的地列表；
+3. Publisher 开始把数据 unicast 到该 endpoint。</p>
+<h2 id="174-dynamic">17.4 一段可运行示例（dynamic）</h2>
+<p>Publisher：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">try</span><span class="w"> </span><span class="p">(</span><span class="n">MediaDriver</span><span class="w"> </span><span class="n">driver</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">MediaDriver</span><span class="p">.</span><span class="na">launchEmbedded</span><span class="p">();</span>
+<span class="w">     </span><span class="n">Aeron</span><span class="w"> </span><span class="n">aeron</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Aeron</span><span class="p">.</span><span class="na">connect</span><span class="p">(</span><span class="k">new</span><span class="w"> </span><span class="n">Aeron</span><span class="p">.</span><span class="na">Context</span><span class="p">()</span>
+<span class="w">             </span><span class="p">.</span><span class="na">aeronDirectoryName</span><span class="p">(</span><span class="n">driver</span><span class="p">.</span><span class="na">aeronDirectoryName</span><span class="p">()));</span>
+<span class="w">     </span><span class="n">Publication</span><span class="w"> </span><span class="n">pub</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">aeron</span><span class="p">.</span><span class="na">addPublication</span><span class="p">(</span>
+<span class="w">             </span><span class="s">&quot;aeron:udp?control=127.0.0.1:41000|control-mode=dynamic&quot;</span><span class="p">,</span><span class="w"> </span><span class="mi">1001</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">pub</span><span class="p">.</span><span class="na">isConnected</span><span class="p">())</span><span class="w"> </span><span class="n">Thread</span><span class="p">.</span><span class="na">sleep</span><span class="p">(</span><span class="mi">10</span><span class="p">);</span>
+<span class="w">    </span><span class="c1">// ... offer 循环</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>Subscriber A：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">Subscription</span><span class="w"> </span><span class="n">subA</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">aeron</span><span class="p">.</span><span class="na">addSubscription</span><span class="p">(</span>
+<span class="w">    </span><span class="s">&quot;aeron:udp?endpoint=127.0.0.1:40456|control=127.0.0.1:41000&quot;</span><span class="p">,</span><span class="w"> </span><span class="mi">1001</span><span class="p">);</span>
+</code></pre></div>
+
+<p>Subscriber B（另一台机器或不同端口）：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">Subscription</span><span class="w"> </span><span class="n">subB</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">aeron</span><span class="p">.</span><span class="na">addSubscription</span><span class="p">(</span>
+<span class="w">    </span><span class="s">&quot;aeron:udp?endpoint=127.0.0.1:40457|control=127.0.0.1:41000&quot;</span><span class="p">,</span><span class="w"> </span><span class="mi">1001</span><span class="p">);</span>
+</code></pre></div>
+
+<p>Publisher 只需要 offer 一次，driver 自动把包发到 40456 和 40457。</p>
+<h2 id="175-manual-dynamic">17.5 何时选 manual、何时 dynamic</h2>
+<table>
+<thead>
+<tr>
+<th>选 manual</th>
+<th>选 dynamic</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>订阅方列表由配置系统管理</td>
+<td>订阅方动态上下线</td>
+</tr>
+<tr>
+<td>需要审计 / 权限控制</td>
+<td>内部信任网络</td>
+</tr>
+<tr>
+<td>Cluster 的 leader → followers 广播</td>
+<td>行情分发到多个策略</td>
+</tr>
+</tbody>
+</table>
+<h2 id="176-mdc-flow-control">17.6 MDC + Flow Control</h2>
+<p>MDC 的 Publisher 会为每个目的地维护独立的 flow control（不是组播的 min/max）。因此：</p>
+<ul>
+<li>一个订阅方慢，不影响其他订阅方（只影响 Publisher 到该 endpoint 的进度）；</li>
+<li>但如果 term-length 有限，最慢的 endpoint 也会拖 Publisher 的整体位置。</li>
+</ul>
+<h2 id="177-archive">17.7 与 Archive 的组合</h2>
+<p>MDC 常和 Aeron Archive 搭配：</p>
+<div class="codehilite"><pre><span></span><code>Publisher ─┬─▶ Sub A (业务消费)
+           ├─▶ Sub B (业务消费)
+           └─▶ Archive Recorder (持久化)
+</code></pre></div>
+
+<p>新加入的订阅方可以用 replay-merge（Ch20）从 Archive 补齐历史。</p>
+<h2 id="178">17.8 常见陷阱</h2>
+<ol>
+<li><strong>忘记 <code>control-mode=dynamic</code></strong>：Publisher 不会接收动态注册。</li>
+<li><strong>control endpoint 与 endpoint 混淆</strong>：control 是"注册端"，endpoint 是"数据端"。</li>
+<li><strong>NAT 穿透</strong>：dynamic MDC 需要订阅方能主动连到 Publisher control endpoint。</li>
+<li><strong>manual 模式忘记 addDestination</strong>：Publisher 有数据但没人收。</li>
+<li><strong>destination 掉线不清理</strong>：可能触发 unblock；manual 模式要主动 removeDestination。</li>
+</ol>
+<h2 id="179">17.9 小结</h2>
+<ul>
+<li>MDC = 单播的 1:N 版本，云原生友好；</li>
+<li>生产选 dynamic MDC 多，manual 用于强控场景；</li>
+<li>与 Archive 组合是"新订阅方补历史"的标准套路。</li>
+</ul>
+<nav class="chapter-nav"><a href="ch16-multicast.html" class="nav-link">← 第 16 章 · UDP Multicast</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch18-req-resp.html" class="nav-link next">第 18 章 · Request / Response 模式 →</a></nav>
+</article>
+<script>
+  // 高亮所有非 mermaid 代码块
+  document.querySelectorAll('pre code:not(.language-mermaid)').forEach(el => {
+    if (window.hljs) hljs.highlightElement(el);
+  });
+</script>
+</body>
+</html>

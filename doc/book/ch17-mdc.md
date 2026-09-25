@@ -7,6 +7,31 @@
 - 会画 MDC 的 wire diagram；
 - 明白 MDC 与组播的取舍。
 
+## 本章速览：manual vs dynamic
+
+```mermaid
+flowchart LR
+    subgraph MAN["Manual MDC（严控名单）"]
+        MP[Publisher] --> MA[destination A]
+        MP --> MB[destination B]
+        MP --> MC[destination C]
+        CONF[配置系统<br/>addDestination] -.管理.-> MP
+    end
+    subgraph DYN["Dynamic MDC（订阅方自助）"]
+        DP[Publisher<br/>开 control endpoint]
+        DS1[Sub A] -.主动注册.-> DP
+        DS2[Sub B] -.主动注册.-> DP
+        DS3[Sub C] -.主动注册.-> DP
+        DP --> DS1
+        DP --> DS2
+        DP --> DS3
+    end
+    style MAN fill:#fef3c7
+    style DYN fill:#caffbf
+```
+
+**选择**：内部审计场景选 manual；行情/公开广播场景选 dynamic。
+
 ## 17.1 MDC 是什么
 
 **Multi-Destination Cast** = "Publisher 一份数据，发到 N 个单播目的地"。

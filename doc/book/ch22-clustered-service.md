@@ -8,6 +8,31 @@
 - 学会用 SBE 定义 ingress / egress message；
 - 明白 Snapshot 的写与读。
 
+## 本章速览：一次请求在 Cluster 里的旅行
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant L as Leader Consensus
+    participant F1 as Follower 1
+    participant F2 as Follower 2
+    participant S as Leader Service
+
+    C->>L: offer(request)
+    L->>L: append 到 log
+    L->>F1: replicate
+    L->>F2: replicate
+    F1-->>L: ack
+    F2-->>L: ack
+    Note over L: quorum 达成 (2/3)
+    L->>S: onSessionMessage(request)
+    S->>S: 更新 state
+    S->>C: session.offer(response)
+    Note over F1,F2: 同时也把消息交给<br/>各自的 Service，同步更新
+```
+
+**核心保证**：任何一条消息只有在 **多数派已经写入日志** 后才被交给 Service 执行，保证 leader 挂了后其他节点也能继续。
+
 ## 22.1 依赖
 
 ```xml
@@ -154,6 +179,33 @@ for (int i = 0; i < 5; i++) {
 预期输出：`counter = 1`, `counter = 2`, ... `counter = 5`。
 
 ## 22.6 演示 fail-over
+
+**fail-over 时序**：
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as Node A<br/>(Leader)
+    participant B as Node B
+    participant D as Node C
+
+    C->>A: offer(req)
+    A-->>C: response OK
+    Note over A: 💥 kill -9
+
+    C->>A: offer(req)
+    Note over C: TCP/UDP timeout
+    B->>D: 心跳丢失, 触发选举
+    B->>B: candidate
+    B->>D: RequestVote
+    D-->>B: VoteGranted
+    Note over B: 变成 LEADER
+
+    C->>B: 自动重连
+    C->>B: offer(req)
+    B-->>C: response OK
+```
+
 
 - 找到 leader（日志里有 role=LEADER 的进程）
 - 直接 kill 掉

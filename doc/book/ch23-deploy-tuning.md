@@ -7,6 +7,43 @@
 - 会做基准测试，识别延迟瓶颈；
 - 掌握生产必备的监控指标。
 
+## 本章速览：生产部署拓扑
+
+```mermaid
+flowchart TB
+    subgraph HOST["物理机 / 裸金属"]
+        subgraph OS["Linux 内核调优"]
+            SHM["/dev/shm tmpfs<br/>存 aeron 目录"]
+            HP[hugepages]
+            SB[so_rcvbuf/so_sndbuf 128MB]
+        end
+        subgraph SYS["systemd 管理"]
+            MD[aeron-driver.service<br/>绑核 CPU 2,3,4]
+            AR[aeron-archive.service<br/>绑核 CPU 5]
+        end
+        subgraph BIZ["业务进程"]
+            APP1[market-gateway<br/>绑核 CPU 6,7]
+            APP2[strategy-engine<br/>绑核 CPU 8,9]
+        end
+    end
+    subgraph MON["监控栈"]
+        AS[AeronStat CLI]
+        PROM[Prometheus exporter]
+        DASH[Grafana Dashboard]
+    end
+    MD --> SHM
+    AR --> SHM
+    APP1 --> SHM
+    APP2 --> SHM
+    AS -->|mmap cnc.dat| SHM
+    PROM -->|读 counter| SHM
+    PROM --> DASH
+    style SHM fill:#caffbf
+    style MD fill:#a0c4ff
+    style APP1 fill:#fef3c7
+    style APP2 fill:#fef3c7
+```
+
 ## 23.1 独立部署 MediaDriver
 
 `/etc/systemd/system/aeron-driver.service`：
@@ -150,6 +187,22 @@ histogram.outputPercentileDistribution(System.out, 1.0);
 关注 P50 / P99 / P99.99。
 
 ## 23.6 常见延迟数字（参考）
+
+**直观量级图**：
+
+```
+路径                       中位数    ▁▂▃▅▆▇█
+─────────────────────────────────────────────────
+IPC 8 字节 one-way          200ns   ▁
+IPC 64 字节 one-way         600ns   ▁
+UDP LAN 10GbE               8μs     ▃
+UDP LAN 1GbE                15μs    ▅
+gRPC LAN                    500μs   ▇
+Kafka                       5ms     █
+
+同一台机器 → 用 IPC   跨机 → 用 UDP + 10GbE
+```
+
 
 | 场景 | 中位数 | P99 |
 |---|---|---|

@@ -7,6 +7,28 @@
 - 了解 aeron-cookbook 中的 request/response 模式；
 - 掌握 correlationId + reply channel 的思路。
 
+## 本章速览：双向 stream + correlationId
+
+```mermaid
+sequenceDiagram
+    participant CLI as Client
+    participant REQ as Request stream
+    participant SRV as Server
+    participant RESP as Response stream
+
+    Note over CLI: 生成 correlationId=42
+    CLI->>REQ: offer {cid=42, method, args}
+    Note over CLI: pending[42] = callback
+    SRV->>REQ: poll
+    SRV->>SRV: 处理请求
+    SRV->>RESP: offer {cid=42, result}
+    CLI->>RESP: poll
+    Note over CLI: 从 pending 查 42, 触发回调
+    CLI->>CLI: 完成
+```
+
+**核心**：Aeron 只提供单向 pub/sub，双向靠"两条 stream + correlationId 关联"。
+
 ## 18.1 Aeron 没有内建 RPC
 
 Aeron 只提供单向 pub/sub。想做 RPC 要业务层组合：

@@ -7,6 +7,26 @@
 - 会用 `startRecording` / `stopRecording`；
 - 知道 recording 的存储布局与命名。
 
+## 本章速览：Archive 在数据流中的位置
+
+```mermaid
+flowchart LR
+    P[Publisher] --> MD[MediaDriver]
+    MD --> S1[业务 Sub A]
+    MD --> S2[业务 Sub B]
+    MD --> AR[Archive Recorder]
+    AR --> DISK[(Segment 文件<br/>1 GB 一段)]
+    DISK -.replay.-> PLAYER[Archive Replayer]
+    PLAYER --> MD2[MediaDriver]
+    MD2 --> LATE[迟到的 Sub]
+
+    style AR fill:#a0c4ff
+    style DISK fill:#fdffb6
+    style PLAYER fill:#a0c4ff
+```
+
+**记忆**：Archive 是"数据流的录像机"——旁路挂在总线上录，也能任意时刻倒放。
+
 ## 19.1 Archive 是什么
 
 Aeron Archive = Aeron Transport 之上的"持久化 + 回放"服务。
@@ -134,7 +154,25 @@ archive.listRecordingsForUri(0, Integer.MAX_VALUE,
     "aeron:udp?endpoint=localhost:40456", 1001, callback);
 ```
 
-## 19.8 Segment 文件布局
+## 19.8 录制生命周期
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle: 空闲
+    Idle --> Recording: startRecording()
+    Recording --> Recording: 持续追加 segment
+    Recording --> Idle: stopRecording()
+    Idle --> Purged: purgeRecording()
+    Recording --> Purged: stop + purge
+    Purged --> [*]
+
+    note right of Recording
+        segment 文件不断累积
+        1 GB 一个
+    end note
+```
+
+## 19.9 Segment 文件布局
 
 ```
 /tmp/aeron-archive/
@@ -146,7 +184,7 @@ archive.listRecordingsForUri(0, Integer.MAX_VALUE,
 
 Segment 文件本质就是 term buffer 的连续快照 + Aeron header。
 
-## 19.9 存储管理
+## 19.10 存储管理
 
 Archive 的存储不是无限的，需要主动管理：
 
@@ -160,7 +198,7 @@ archive.truncateRecording(recordingId, position);  // 只保留到某个 positio
 - 只保留最近 N 小时在本地；
 - 用 SSD，segment 顺序写吞吐能到 GB/s。
 
-## 19.10 一个可运行示例
+## 19.11 一个可运行示例
 
 ```java
 try (MediaDriver driver = MediaDriver.launchEmbedded();
@@ -192,14 +230,14 @@ try (MediaDriver driver = MediaDriver.launchEmbedded();
 
 跑完后 `/tmp/aeron-archive-demo/` 里能看到 segment 文件。
 
-## 19.11 常见陷阱
+## 19.12 常见陷阱
 
 1. **忘记 replicationChannel**：Cluster 或 replicate 场景会报错，就算不用也建议指定。
 2. **磁盘满**：Archive 会停止录制，Publisher 侧变 BackPressure。
 3. **Archive 与业务 driver 混用同一 aeronDir**：可以，但要注意 segment 对磁盘 IO 的影响。
 4. **控制通道错**：controlRequestChannel / controlResponseChannel 双方要匹配。
 
-## 19.12 小结
+## 19.13 小结
 
 - Archive = 录制 + 回放服务，不是 broker
 - startRecording / stopRecording 是核心命令

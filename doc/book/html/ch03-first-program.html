@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 03 章 · 环境准备与第一个可运行程序</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-light.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/index.min.js"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose" });
+</script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+                 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2em 1em 4em;
+    background: #fafafa;
+    color: #24292f;
+  }
+  .markdown-body {
+    background: #ffffff;
+    padding: 2.5em 3em;
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+  }
+  .markdown-body pre {
+    background: #f6f8fa !important;
+  }
+  .markdown-body pre.mermaid {
+    background: transparent !important;
+    text-align: center;
+    padding: 1em;
+  }
+  nav.chapter-nav {
+    display: flex;
+    justify-content: space-between;
+    padding: 1em;
+    margin-bottom: 1.5em;
+    background: #eef2f7;
+    border-radius: 8px;
+    font-size: 0.95em;
+  }
+  nav.chapter-nav a {
+    color: #0969da;
+    text-decoration: none;
+  }
+  nav.chapter-nav a:hover { text-decoration: underline; }
+  nav.chapter-nav .nav-link { min-width: 30%; }
+  nav.chapter-nav .nav-link.next { text-align: right; }
+  nav.chapter-nav .nav-link.home { text-align: center; }
+</style>
+</head>
+<body>
+<article class="markdown-body">
+<nav class="chapter-nav"><a href="ch02-core-concepts.html" class="nav-link">← 第 02 章 · 六个核心概念快览</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch04-media-driver.html" class="nav-link next">第 04 章 · MediaDriver：从嵌入式到独立部署 →</a></nav>
+<h1 id="03">第 03 章 · 环境准备与第一个可运行程序</h1>
+<h2 id="_1">学习目标</h2>
+<ul>
+<li>搭好一个能编译、能跑的 Aeron Maven 工程；</li>
+<li>亲手把 demo01 (<code>Demo01HelloAeron</code>) 跑起来，看到消息从 Publisher 流到 Subscriber；</li>
+<li>知道日志里每个字段的含义。</li>
+</ul>
+<h2 id="_2">本章速览</h2>
+<pre class="mermaid">
+flowchart LR
+    A[① pom.xml<br/>依赖引入] --> B[② log4j2.xml<br/>压噪音]
+    B --> C[③ 写代码<br/>Demo01HelloAeron]
+    C --> D[④ mvn exec:java<br/>看到消息]
+    style A fill:#caffbf
+    style B fill:#caffbf
+    style C fill:#ffd6a5
+    style D fill:#a0c4ff
+</pre>
+
+<p><strong>四步走</strong>：加依赖 → 配日志 → 写 main → 跑起来。总耗时 5 分钟。</p>
+<h2 id="31">3.1 依赖清单</h2>
+<p><code>pom.xml</code>：</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">&lt;properties&gt;</span>
+<span class="w">    </span><span class="nt">&lt;maven.compiler.source&gt;</span>21<span class="nt">&lt;/maven.compiler.source&gt;</span>
+<span class="w">    </span><span class="nt">&lt;maven.compiler.target&gt;</span>21<span class="nt">&lt;/maven.compiler.target&gt;</span>
+<span class="w">    </span><span class="nt">&lt;aeron.version&gt;</span>1.44.1<span class="nt">&lt;/aeron.version&gt;</span>
+<span class="w">    </span><span class="nt">&lt;log4j.version&gt;</span>2.23.1<span class="nt">&lt;/log4j.version&gt;</span>
+<span class="nt">&lt;/properties&gt;</span>
+
+<span class="nt">&lt;dependencies&gt;</span>
+<span class="w">    </span><span class="nt">&lt;dependency&gt;</span>
+<span class="w">        </span><span class="nt">&lt;groupId&gt;</span>io.aeron<span class="nt">&lt;/groupId&gt;</span>
+<span class="w">        </span><span class="nt">&lt;artifactId&gt;</span>aeron-driver<span class="nt">&lt;/artifactId&gt;</span>
+<span class="w">        </span><span class="nt">&lt;version&gt;</span>${aeron.version}<span class="nt">&lt;/version&gt;</span>
+<span class="w">    </span><span class="nt">&lt;/dependency&gt;</span>
+<span class="w">    </span><span class="nt">&lt;dependency&gt;</span>
+<span class="w">        </span><span class="nt">&lt;groupId&gt;</span>io.aeron<span class="nt">&lt;/groupId&gt;</span>
+<span class="w">        </span><span class="nt">&lt;artifactId&gt;</span>aeron-client<span class="nt">&lt;/artifactId&gt;</span>
+<span class="w">        </span><span class="nt">&lt;version&gt;</span>${aeron.version}<span class="nt">&lt;/version&gt;</span>
+<span class="w">    </span><span class="nt">&lt;/dependency&gt;</span>
+<span class="w">    </span><span class="nt">&lt;dependency&gt;</span>
+<span class="w">        </span><span class="nt">&lt;groupId&gt;</span>org.apache.logging.log4j<span class="nt">&lt;/groupId&gt;</span>
+<span class="w">        </span><span class="nt">&lt;artifactId&gt;</span>log4j-core<span class="nt">&lt;/artifactId&gt;</span>
+<span class="w">        </span><span class="nt">&lt;version&gt;</span>${log4j.version}<span class="nt">&lt;/version&gt;</span>
+<span class="w">    </span><span class="nt">&lt;/dependency&gt;</span>
+<span class="nt">&lt;/dependencies&gt;</span>
+</code></pre></div>
+
+<p>要点：
+- <code>aeron-driver</code> 与 <code>aeron-client</code> 都要，前者含 <code>MediaDriver</code>；
+- <code>aeron-client</code> 自动传染依赖 <code>agrona</code>（提供 <code>UnsafeBuffer</code> / <code>IdleStrategy</code>）；
+- JDK 21 是本书基线；JDK 17 也能工作。</p>
+<h2 id="32-aeron">3.2 关闭 Aeron 内部日志的噪音</h2>
+<p>Aeron 内部用 <code>java.util.logging</code>，跑起来会打很多东西。用 log4j2 把它们压到 WARN：</p>
+<p><code>src/main/resources/log4j2.xml</code>：</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">&lt;Configuration</span><span class="w"> </span><span class="na">status=</span><span class="s">&quot;WARN&quot;</span><span class="nt">&gt;</span>
+<span class="w">    </span><span class="nt">&lt;Appenders&gt;</span>
+<span class="w">        </span><span class="nt">&lt;Console</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;Console&quot;</span><span class="w"> </span><span class="na">target=</span><span class="s">&quot;SYSTEM_OUT&quot;</span><span class="nt">&gt;</span>
+<span class="w">            </span><span class="nt">&lt;PatternLayout</span><span class="w"> </span><span class="na">pattern=</span><span class="s">&quot;%d{HH:mm:ss.SSS} [%t] %-5level %logger{1} - %msg%n&quot;</span><span class="nt">/&gt;</span>
+<span class="w">        </span><span class="nt">&lt;/Console&gt;</span>
+<span class="w">    </span><span class="nt">&lt;/Appenders&gt;</span>
+<span class="w">    </span><span class="nt">&lt;Loggers&gt;</span>
+<span class="w">        </span><span class="nt">&lt;Logger</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;io.aeron&quot;</span><span class="w">   </span><span class="na">level=</span><span class="s">&quot;WARN&quot;</span><span class="nt">/&gt;</span>
+<span class="w">        </span><span class="nt">&lt;Logger</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;org.agrona&quot;</span><span class="w"> </span><span class="na">level=</span><span class="s">&quot;WARN&quot;</span><span class="nt">/&gt;</span>
+<span class="w">        </span><span class="nt">&lt;Logger</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;org.example&quot;</span><span class="w"> </span><span class="na">level=</span><span class="s">&quot;INFO&quot;</span><span class="nt">/&gt;</span>
+<span class="w">        </span><span class="nt">&lt;Root</span><span class="w"> </span><span class="na">level=</span><span class="s">&quot;INFO&quot;</span><span class="nt">&gt;&lt;AppenderRef</span><span class="w"> </span><span class="na">ref=</span><span class="s">&quot;Console&quot;</span><span class="nt">/&gt;&lt;/Root&gt;</span>
+<span class="w">    </span><span class="nt">&lt;/Loggers&gt;</span>
+<span class="nt">&lt;/Configuration&gt;</span>
+</code></pre></div>
+
+<h2 id="33">3.3 最小可运行示例</h2>
+<p><strong>8 步走通全流程</strong>：</p>
+<pre class="mermaid">
+flowchart TD
+    A[Step 1<br/>MediaDriver.launchEmbedded] --> B[Step 2<br/>Aeron.connect]
+    B --> C[Step 3<br/>addPublication]
+    B --> D[Step 4<br/>addSubscription]
+    C --> E[Step 5<br/>等 isConnected]
+    D --> E
+    E --> F[Step 6<br/>UnsafeBuffer 装消息]
+    F --> G[Step 7<br/>offer 发送]
+    G --> H[Step 8<br/>poll 接收+回调]
+    H --> I{还有消息?}
+    I -->|是| G
+    I -->|否| J[close 释放]
+    style A fill:#ffd6a5
+    style G fill:#caffbf
+    style H fill:#a0c4ff
+</pre>
+
+<p>参见配套代码 <code>aeron/src/main/java/org/example/demo01/Demo01HelloAeron.java</code>。核心 4 步：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1">// 1. 内嵌 MediaDriver</span>
+<span class="k">try</span><span class="w"> </span><span class="p">(</span><span class="n">MediaDriver</span><span class="w"> </span><span class="n">driver</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">MediaDriver</span><span class="p">.</span><span class="na">launchEmbedded</span><span class="p">();</span>
+<span class="w">     </span><span class="c1">// 2. 连接 Aeron Client（必须指向 driver 的目录）</span>
+<span class="w">     </span><span class="n">Aeron</span><span class="w"> </span><span class="n">aeron</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Aeron</span><span class="p">.</span><span class="na">connect</span><span class="p">(</span><span class="k">new</span><span class="w"> </span><span class="n">Aeron</span><span class="p">.</span><span class="na">Context</span><span class="p">()</span>
+<span class="w">             </span><span class="p">.</span><span class="na">aeronDirectoryName</span><span class="p">(</span><span class="n">driver</span><span class="p">.</span><span class="na">aeronDirectoryName</span><span class="p">()));</span>
+<span class="w">     </span><span class="c1">// 3. Publication &amp; Subscription</span>
+<span class="w">     </span><span class="n">Publication</span><span class="w"> </span><span class="n">publication</span><span class="w">  </span><span class="o">=</span><span class="w"> </span><span class="n">aeron</span><span class="p">.</span><span class="na">addPublication</span><span class="p">(</span><span class="s">&quot;aeron:ipc&quot;</span><span class="p">,</span><span class="w"> </span><span class="mi">1001</span><span class="p">);</span>
+<span class="w">     </span><span class="n">Subscription</span><span class="w"> </span><span class="n">subscription</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">aeron</span><span class="p">.</span><span class="na">addSubscription</span><span class="p">(</span><span class="s">&quot;aeron:ipc&quot;</span><span class="p">,</span><span class="w"> </span><span class="mi">1001</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">publication</span><span class="p">.</span><span class="na">isConnected</span><span class="p">()</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="o">!</span><span class="n">subscription</span><span class="p">.</span><span class="na">isConnected</span><span class="p">())</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">Thread</span><span class="p">.</span><span class="na">sleep</span><span class="p">(</span><span class="mi">10</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="n">UnsafeBuffer</span><span class="w"> </span><span class="n">buffer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">UnsafeBuffer</span><span class="p">(</span><span class="n">ByteBuffer</span><span class="p">.</span><span class="na">allocateDirect</span><span class="p">(</span><span class="mi">256</span><span class="p">));</span>
+<span class="w">    </span><span class="kt">byte</span><span class="o">[]</span><span class="w"> </span><span class="n">bytes</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">&quot;hello-aeron&quot;</span><span class="p">.</span><span class="na">getBytes</span><span class="p">(</span><span class="n">StandardCharsets</span><span class="p">.</span><span class="na">UTF_8</span><span class="p">);</span>
+<span class="w">    </span><span class="n">buffer</span><span class="p">.</span><span class="na">putBytes</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">bytes</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 4. offer 发送</span>
+<span class="w">    </span><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="n">publication</span><span class="p">.</span><span class="na">offer</span><span class="p">(</span><span class="n">buffer</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">bytes</span><span class="p">.</span><span class="na">length</span><span class="p">)</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="n">Thread</span><span class="p">.</span><span class="na">yield</span><span class="p">();</span>
+
+<span class="w">    </span><span class="c1">// 5. poll 接收</span>
+<span class="w">    </span><span class="n">subscription</span><span class="p">.</span><span class="na">poll</span><span class="p">((</span><span class="n">buf</span><span class="p">,</span><span class="w"> </span><span class="n">offset</span><span class="p">,</span><span class="w"> </span><span class="n">length</span><span class="p">,</span><span class="w"> </span><span class="n">header</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kt">byte</span><span class="o">[]</span><span class="w"> </span><span class="n">out</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="kt">byte</span><span class="o">[</span><span class="n">length</span><span class="o">]</span><span class="p">;</span>
+<span class="w">        </span><span class="n">buf</span><span class="p">.</span><span class="na">getBytes</span><span class="p">(</span><span class="n">offset</span><span class="p">,</span><span class="w"> </span><span class="n">out</span><span class="p">);</span>
+<span class="w">        </span><span class="n">log</span><span class="p">.</span><span class="na">info</span><span class="p">(</span><span class="s">&quot;收到: {}&quot;</span><span class="p">,</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">String</span><span class="p">(</span><span class="n">out</span><span class="p">,</span><span class="w"> </span><span class="n">StandardCharsets</span><span class="p">.</span><span class="na">UTF_8</span><span class="p">));</span>
+<span class="w">    </span><span class="p">},</span><span class="w"> </span><span class="mi">10</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h2 id="34">3.4 运行方式</h2>
+<p>命令行：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 确保 JAVA_HOME 指向 JDK 21</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">JAVA_HOME</span><span class="o">=</span>/Library/Java/JavaVirtualMachines/jdk-21.jdk/Contents/Home
+mvn<span class="w"> </span>-q<span class="w"> </span>exec:java<span class="w"> </span>-Dexec.mainClass<span class="o">=</span>org.example.demo01.Demo01HelloAeron
+</code></pre></div>
+
+<p>预期输出：</p>
+<div class="codehilite"><pre><span></span><code>13:19:02.055 [main] INFO  Demo01HelloAeron - 等待 Publication 与 Subscription 建立连接 ...
+13:19:02.069 [main] INFO  Demo01HelloAeron - Publication / Subscription 已连接：aeron:ipc streamId=1001
+13:19:02.070 [main] INFO  Demo01HelloAeron - [Publisher] 已发送：hello-aeron-0 (position=64)
+13:19:02.070 [main] INFO  Demo01HelloAeron - [Subscriber] 收到消息：hello-aeron-0
+...
+</code></pre></div>
+
+<h2 id="35">3.5 日志字段解读</h2>
+<ul>
+<li><code>position=64</code>：这是发送成功后的 <strong>流位置</strong>（stream position），单位字节。
+   每条消息占用的字节包含 <strong>Aeron header (32 字节) + payload</strong>，所以第一条 payload=11 字节，position=64（下一条起点）。</li>
+<li><code>sessionId</code>：Publisher 的会话号，每次新建 Publication 会变；Subscriber 用它区分不同 Publisher 实例。</li>
+<li><code>pos</code>：流位置在 Publisher 端和 Subscriber 端都能读，用于监控进度 / 排查延迟。</li>
+</ul>
+<h2 id="36">3.6 目录布局</h2>
+<p>内嵌 MediaDriver 会在 <code>java.io.tmpdir</code> 下生成一个类似 <code>/var/folders/xx/aeron-&lt;user&gt;-&lt;timestamp&gt;</code> 的目录：</p>
+<div class="codehilite"><pre><span></span><code>aeron-zxj-1234/
+├── cnc.dat                共享的 command-and-control 元信息
+├── publications/          发布端 term buffer 文件
+├── images/                Subscription 侧的重组镜像
+└── loss-report.dat        丢失报告（Ch14 用）
+</code></pre></div>
+
+<p><strong>结构可视化</strong>：</p>
+<pre class="mermaid">
+flowchart TD
+    ROOT["aeron-zxj-1234/<br/>（driver 目录 = 所有客户端约定的会合点）"]
+    ROOT --> CNC["cnc.dat<br/>元数据、counter、error log<br/>~1 MB"]
+    ROOT --> PUB["publications/<br/>每个 Publisher 一个文件<br/>~48 MB (3×term)"]
+    ROOT --> IMG["images/<br/>Subscriber 的接收镜像"]
+    ROOT --> LOSS["loss-report.dat<br/>UDP 丢包记录"]
+    style CNC fill:#ffd6a5
+    style PUB fill:#caffbf
+    style IMG fill:#a0c4ff
+</pre>
+
+<ul>
+<li>独立部署 MediaDriver 时（demo03）会使用固定目录 <code>${TMPDIR}/aeron-${user}</code></li>
+<li>如果上次异常退出留下了脏目录，用 <code>dirDeleteOnStart(true)</code> 清理，见 Ch04</li>
+</ul>
+<h2 id="37">3.7 常见启动错误</h2>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>原因</th>
+<th>解决</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>一直卡在 <code>!publication.isConnected()</code></td>
+<td><code>aeronDirectoryName</code> 没对齐，client 连的不是同一个 driver</td>
+<td>显式传目录</td>
+</tr>
+<tr>
+<td><code>AeronException: Aeron driver not found</code></td>
+<td>driver 还没起 or 目录不存在</td>
+<td>先启 driver 再 connect</td>
+</tr>
+<tr>
+<td><code>IllegalStateException: existing publication</code></td>
+<td>同 channel+streamId 已存在 exclusive publication</td>
+<td>换 streamId 或关掉旧的</td>
+</tr>
+<tr>
+<td>频繁 GC</td>
+<td>每次发送都 <code>new byte[]</code> / <code>new String</code></td>
+<td>复用 UnsafeBuffer（Ch10）</td>
+</tr>
+</tbody>
+</table>
+<h2 id="38">3.8 小结</h2>
+<p>跑通 demo01，你就完成了 Aeron 学习路径 Level 1~3。下一章开始，我们把 MediaDriver 单独拆出来讲：ThreadingMode、Context 配置、独立部署等真实生产考量。</p>
+<nav class="chapter-nav"><a href="ch02-core-concepts.html" class="nav-link">← 第 02 章 · 六个核心概念快览</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch04-media-driver.html" class="nav-link next">第 04 章 · MediaDriver：从嵌入式到独立部署 →</a></nav>
+</article>
+<script>
+  // 高亮所有非 mermaid 代码块
+  document.querySelectorAll('pre code:not(.language-mermaid)').forEach(el => {
+    if (window.hljs) hljs.highlightElement(el);
+  });
+</script>
+</body>
+</html>

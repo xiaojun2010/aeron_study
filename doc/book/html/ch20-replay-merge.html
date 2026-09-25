@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 20 章 · Replay / Replay-Merge / Live Merge</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-light.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/index.min.js"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose" });
+</script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+                 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2em 1em 4em;
+    background: #fafafa;
+    color: #24292f;
+  }
+  .markdown-body {
+    background: #ffffff;
+    padding: 2.5em 3em;
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+  }
+  .markdown-body pre {
+    background: #f6f8fa !important;
+  }
+  .markdown-body pre.mermaid {
+    background: transparent !important;
+    text-align: center;
+    padding: 1em;
+  }
+  nav.chapter-nav {
+    display: flex;
+    justify-content: space-between;
+    padding: 1em;
+    margin-bottom: 1.5em;
+    background: #eef2f7;
+    border-radius: 8px;
+    font-size: 0.95em;
+  }
+  nav.chapter-nav a {
+    color: #0969da;
+    text-decoration: none;
+  }
+  nav.chapter-nav a:hover { text-decoration: underline; }
+  nav.chapter-nav .nav-link { min-width: 30%; }
+  nav.chapter-nav .nav-link.next { text-align: right; }
+  nav.chapter-nav .nav-link.home { text-align: center; }
+</style>
+</head>
+<body>
+<article class="markdown-body">
+<nav class="chapter-nav"><a href="ch19-archive-basics.html" class="nav-link">← 第 19 章 · Aeron Archive：概览与录制</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch21-cluster-overview.html" class="nav-link next">第 21 章 · Aeron Cluster：概述与 Raft →</a></nav>
+<h1 id="20-replay-replay-merge-live-merge">第 20 章 · Replay / Replay-Merge / Live Merge</h1>
+<h2 id="_1">学习目标</h2>
+<ul>
+<li>学会 <code>replay</code> / <code>startReplay</code> / <code>replayMerge</code> 三种回放 API；</li>
+<li>明白 Replay-Merge 如何解决"新订阅方追赶实时流"问题；</li>
+<li>掌握 replay 与 live subscription 的 sessionId / position 对齐；</li>
+<li>认识 aeron-cookbook 里 <code>archive-replay-merge</code> 的骨架。</li>
+</ul>
+<h2 id="replay-merge">本章速览：为什么需要 Replay-Merge</h2>
+<pre class="mermaid">
+flowchart LR
+    subgraph BAD["朴素方案（有坑）"]
+        BB1[1. replay 0→now] --> BB2[2. 补完后 addSub]
+        BB2 --> BB3[3. 但补的时候直播还在跑]
+        BB3 --> BB4[4. 中间漏了一段！]
+        style BB4 fill:#fde8e8
+    end
+    subgraph GOOD["ReplayMerge（无缝）"]
+        GG1[启动 ReplayMerge] --> GG2[边补历史边跟直播]
+        GG2 --> GG3[追赶到直播位置]
+        GG3 --> GG4[无缝切到 live subscription]
+        style GG4 fill:#caffbf
+    end
+</pre>
+
+<h2 id="201-api">20.1 三种回放 API</h2>
+<table>
+<thead>
+<tr>
+<th>API</th>
+<th>语义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>replay(recordingId, position, length, replayChannel, replayStreamId)</code></td>
+<td>从 recording 回放一段数据到某个 stream</td>
+</tr>
+<tr>
+<td><code>startReplay(...)</code></td>
+<td>同上，但返回 replaySessionId，可后续 <code>stopReplay</code></td>
+</tr>
+<tr>
+<td><code>replayMerge</code></td>
+<td>从 Archive 回放 + 无缝切到实时流（关键！）</td>
+</tr>
+</tbody>
+</table>
+<h2 id="202-replay">20.2 简单 Replay</h2>
+<div class="codehilite"><pre><span></span><code><span class="kt">long</span><span class="w"> </span><span class="n">replaySessionId</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">archive</span><span class="p">.</span><span class="na">startReplay</span><span class="p">(</span>
+<span class="w">    </span><span class="n">recordingId</span><span class="p">,</span>
+<span class="w">    </span><span class="cm">/*position*/</span><span class="w"> </span><span class="mi">0</span><span class="n">L</span><span class="p">,</span>
+<span class="w">    </span><span class="cm">/*length*/</span><span class="w"> </span><span class="n">Long</span><span class="p">.</span><span class="na">MAX_VALUE</span><span class="p">,</span>
+<span class="w">    </span><span class="s">&quot;aeron:ipc?alias=replay&quot;</span><span class="p">,</span><span class="w">    </span><span class="c1">// 回放 stream</span>
+<span class="w">    </span><span class="mi">2001</span><span class="p">);</span>
+</code></pre></div>
+
+<p>回放会：
+1. Archive 起一个 Publisher 到 <code>aeron:ipc?alias=replay stream=2001</code>；
+2. 从 segment 文件按顺序读，emit 给这个 Publisher；
+3. 业务在这个 stream 上加 Subscription 就能收到。</p>
+<p>停止回放：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">archive</span><span class="p">.</span><span class="na">stopReplay</span><span class="p">(</span><span class="n">replaySessionId</span><span class="p">);</span>
+</code></pre></div>
+
+<h2 id="203-replay-merge">20.3 Replay-Merge 是什么</h2>
+<p><strong>问题</strong>：一个"迟到的订阅方"想收实时流，但它从 position=0 开始订阅会漏掉几个小时的历史 → 需要先"从 Archive 补历史，然后无缝切到实时流"。</p>
+<p><strong>普通做法（有坑）</strong>：
+1. <code>replay(0, currentPos)</code> 补历史；
+2. 补完再 addSubscription 收实时。
+3. 但补历史期间实时流还在跑 → 补完的 currentPos 已经落后了。</p>
+<p><strong>Replay-Merge 做法</strong>：Aeron 自动处理"追赶 → 无缝切换"：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">ReplayMerge</span><span class="w"> </span><span class="n">merge</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">ReplayMerge</span><span class="p">(</span>
+<span class="w">    </span><span class="n">subscription</span><span class="p">,</span><span class="w">                              </span><span class="c1">// 目标业务 subscription</span>
+<span class="w">    </span><span class="n">archive</span><span class="p">,</span><span class="w">                                   </span><span class="c1">// AeronArchive client</span>
+<span class="w">    </span><span class="s">&quot;aeron:udp?endpoint=archive-host:8020&quot;</span><span class="p">,</span><span class="w">    </span><span class="c1">// replay 控制目的</span>
+<span class="w">    </span><span class="s">&quot;aeron:udp?endpoint=me:0&quot;</span><span class="p">,</span><span class="w">                 </span><span class="c1">// replay 发到我这里的 endpoint</span>
+<span class="w">    </span><span class="s">&quot;aeron:udp?endpoint=publisher-host:40456&quot;</span><span class="p">,</span><span class="w"> </span><span class="c1">// live channel</span>
+<span class="w">    </span><span class="n">recordingId</span><span class="p">,</span>
+<span class="w">    </span><span class="cm">/*startPos*/</span><span class="w"> </span><span class="mi">0</span><span class="n">L</span><span class="p">);</span>
+
+<span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">merge</span><span class="p">.</span><span class="na">isMerged</span><span class="p">())</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">fragments</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">merge</span><span class="p">.</span><span class="na">poll</span><span class="p">(</span><span class="n">handler</span><span class="p">,</span><span class="w"> </span><span class="mi">10</span><span class="p">);</span>
+<span class="w">    </span><span class="n">idleStrategy</span><span class="p">.</span><span class="na">idle</span><span class="p">(</span><span class="n">fragments</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="c1">// merge 后 subscription 就变成&quot;直播 + 已消费历史&quot;</span>
+</code></pre></div>
+
+<h3 id="2031">20.3.1 内部状态机</h3>
+<div class="codehilite"><pre><span></span><code>STATE_CATCH_UP     ← replay 从 startPos 追到 live position
+STATE_ATTEMPT_LIVE ← 尝试加入 live channel
+STATE_MERGED       ← replay stop，subscription 只跟 live
+STATE_CLOSED
+</code></pre></div>
+
+<pre class="mermaid">
+stateDiagram-v2
+    [*] --> ResolveChannel
+    ResolveChannel --> CatchUp: 开始 replay
+    CatchUp --> CatchUp: 追赶 live 位置
+    CatchUp --> AttemptLive: 追上 live
+    AttemptLive --> Merged: 加入 live 成功
+    AttemptLive --> CatchUp: 差距重新拉大
+    Merged --> Closed: 关闭
+    Closed --> [*]
+
+    note right of CatchUp
+        既在 replay 中读历史
+        又在监控 live 位置
+    end note
+    note right of Merged
+        Replay 停止
+        Subscription 只跟 live
+    end note
+</pre>
+
+<p>在切换的过程中，Aeron 保证消息 <strong>不重不漏</strong>，通过对齐 sessionId 和 position 实现。</p>
+<h2 id="204">20.4 一段可运行示例</h2>
+<div class="codehilite"><pre><span></span><code><span class="c1">// 假设 Archive 已录制 recordingId=42，channel=aeron:udp?endpoint=srv:40456, streamId=1001</span>
+
+<span class="n">Subscription</span><span class="w"> </span><span class="n">sub</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">aeron</span><span class="p">.</span><span class="na">addSubscription</span><span class="p">(</span><span class="s">&quot;aeron:udp?endpoint=srv:40456&quot;</span><span class="p">,</span><span class="w"> </span><span class="mi">1001</span><span class="p">);</span>
+
+<span class="n">ReplayMerge</span><span class="w"> </span><span class="n">merge</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">ReplayMerge</span><span class="p">(</span>
+<span class="w">    </span><span class="n">sub</span><span class="p">,</span>
+<span class="w">    </span><span class="n">archive</span><span class="p">,</span>
+<span class="w">    </span><span class="s">&quot;aeron:udp?endpoint=archive:8020&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="s">&quot;aeron:udp?endpoint=&quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">localHost</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="s">&quot;:0&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="s">&quot;aeron:udp?endpoint=srv:40456&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="mi">42</span><span class="p">,</span>
+<span class="w">    </span><span class="mi">0</span><span class="p">);</span>
+
+<span class="n">FragmentHandler</span><span class="w"> </span><span class="n">handler</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">buf</span><span class="p">,</span><span class="w"> </span><span class="n">off</span><span class="p">,</span><span class="w"> </span><span class="n">len</span><span class="p">,</span><span class="w"> </span><span class="n">hdr</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">log</span><span class="p">.</span><span class="na">info</span><span class="p">(</span><span class="s">&quot;collected pos={} len={}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">hdr</span><span class="p">.</span><span class="na">position</span><span class="p">(),</span><span class="w"> </span><span class="n">len</span><span class="p">);</span>
+<span class="p">};</span>
+
+<span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="n">running</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="o">!</span><span class="n">merge</span><span class="p">.</span><span class="na">isClosed</span><span class="p">())</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">f</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">merge</span><span class="p">.</span><span class="na">poll</span><span class="p">(</span><span class="n">handler</span><span class="p">,</span><span class="w"> </span><span class="mi">20</span><span class="p">);</span>
+<span class="w">    </span><span class="n">idle</span><span class="p">.</span><span class="na">idle</span><span class="p">(</span><span class="n">f</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">merge</span><span class="p">.</span><span class="na">isMerged</span><span class="p">())</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">log</span><span class="p">.</span><span class="na">info</span><span class="p">(</span><span class="s">&quot;已合并直播流&quot;</span><span class="p">);</span>
+<span class="w">        </span><span class="k">break</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+<span class="c1">// merge.close() 后 subscription 可以继续作为普通 live subscription 用</span>
+</code></pre></div>
+
+<h2 id="205-bounded-replay">20.5 Bounded Replay</h2>
+<p>有时候不想回放全部，只回放到某个 position：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">image</span><span class="p">.</span><span class="na">boundedPoll</span><span class="p">(</span><span class="n">handler</span><span class="p">,</span><span class="w"> </span><span class="n">endPos</span><span class="p">,</span><span class="w"> </span><span class="mi">10</span><span class="p">);</span>
+</code></pre></div>
+
+<p>或用 Archive 的 replay 接口指定 length：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">archive</span><span class="p">.</span><span class="na">startReplay</span><span class="p">(</span><span class="n">recId</span><span class="p">,</span><span class="w"> </span><span class="n">startPos</span><span class="p">,</span><span class="w"> </span><span class="n">endPos</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">startPos</span><span class="p">,</span><span class="w"> </span><span class="n">replayChannel</span><span class="p">,</span><span class="w"> </span><span class="n">streamId</span><span class="p">);</span>
+</code></pre></div>
+
+<h2 id="206-replicate-archive">20.6 Replicate（跨 Archive 复制）</h2>
+<p>Archive 之间可以互相复制 recording（比如主备 Archive）：</p>
+<div class="codehilite"><pre><span></span><code><span class="kt">long</span><span class="w"> </span><span class="n">correlationId</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">archive</span><span class="p">.</span><span class="na">replicate</span><span class="p">(</span>
+<span class="w">    </span><span class="cm">/*srcRecordingId*/</span><span class="w"> </span><span class="mi">42</span><span class="p">,</span>
+<span class="w">    </span><span class="cm">/*dstRecordingId*/</span><span class="w"> </span><span class="n">Aeron</span><span class="p">.</span><span class="na">NULL_VALUE</span><span class="p">,</span>
+<span class="w">    </span><span class="cm">/*srcControlStreamId*/</span><span class="w"> </span><span class="mi">10</span><span class="p">,</span>
+<span class="w">    </span><span class="cm">/*srcControlChannel*/</span><span class="w"> </span><span class="s">&quot;aeron:udp?endpoint=archive-a:8010&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="cm">/*liveDestination*/</span><span class="w"> </span><span class="kc">null</span><span class="p">);</span>
+</code></pre></div>
+
+<h2 id="207-sessionid">20.7 sessionId 对齐</h2>
+<p>Replay-Merge 的关键难点：Archive 回放出来的 sessionId 与 live Publisher 的 sessionId 不同。Aeron 通过：</p>
+<ol>
+<li>Replay 的 Publication 使用 <strong>原始 recording 的 sessionId</strong>（Archive 会 spoof）；</li>
+<li>Subscription 在同一 (channel, streamId, sessionId) 下把两条 Image 合并；</li>
+<li>位置对齐 → 一致的消息序列。</li>
+</ol>
+<p>这就是为什么 replay-merge 只对 <strong>同一 recording</strong> 有意义。</p>
+<h2 id="208">20.8 常见陷阱</h2>
+<ol>
+<li><strong>忘记 startRecording 就 replay</strong>：报 unknown recordingId。</li>
+<li><strong>replay endpoint 与 live endpoint 冲突</strong>：merge 会失败。</li>
+<li><strong>live subscription 已经 add 但没 add publication 同 sessionId</strong>：driver 认为不 connected。</li>
+<li><strong>replay 太快 term 满</strong>：加大 term-length 或降 replay 速率（有 <code>replayBlockLength</code>）。</li>
+<li><strong>磁盘 IO 不够快</strong>：replay throughput 上限受 SSD 影响。</li>
+</ol>
+<h2 id="209-cluster">20.9 与 Cluster 的关系</h2>
+<p>Cluster 里的每个节点都有本地 Archive；leader 变更时新 leader 通过 Archive replay + replicate 追赶落后节点。Part VII 会看到细节。</p>
+<h2 id="2010">20.10 小结</h2>
+<ul>
+<li>Replay = 从 Archive 拉历史；Replay-Merge = 拉完历史无缝切实时</li>
+<li>Replay-Merge 是 Aeron 生态里最有价值的 pattern 之一</li>
+<li>Cluster 之所以能做到 Raft 恢复，就是靠 Archive replay</li>
+</ul>
+<nav class="chapter-nav"><a href="ch19-archive-basics.html" class="nav-link">← 第 19 章 · Aeron Archive：概览与录制</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch21-cluster-overview.html" class="nav-link next">第 21 章 · Aeron Cluster：概述与 Raft →</a></nav>
+</article>
+<script>
+  // 高亮所有非 mermaid 代码块
+  document.querySelectorAll('pre code:not(.language-mermaid)').forEach(el => {
+    if (window.hljs) hljs.highlightElement(el);
+  });
+</script>
+</body>
+</html>

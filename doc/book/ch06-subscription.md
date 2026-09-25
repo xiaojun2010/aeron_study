@@ -7,6 +7,26 @@
 - 学会用 `Image.position` 和 `boundedPoll` 做"回压 / 限速"；
 - 明白多个 Publisher 打进同一 Subscription 时的语义。
 
+## 本章速览
+
+```mermaid
+flowchart LR
+    subgraph SUB[Subscription]
+        I1[Image<br/>sessionId=A]
+        I2[Image<br/>sessionId=B]
+        I3[Image<br/>sessionId=C]
+    end
+    PA[Publisher A] -->|stream=42| I1
+    PB[Publisher B] -->|stream=42| I2
+    PC[Publisher C] -->|stream=42| I3
+    SUB --> H[FragmentHandler]
+    H --> APP[业务对象]
+    style SUB fill:#fef3c7
+    style H fill:#caffbf
+```
+
+**记忆**：一个 Subscription = 多个 Image 的聚合；每个 Publisher 会话在收方就是一个 Image。
+
 ## 6.1 Subscription 是"多 Image 的聚合"
 
 ```
@@ -24,6 +44,27 @@ Subscription.images() = [ImageA, ImageB, ImageC]
 - `Subscription.poll()` 会轮询它拥有的所有 Image。
 
 ## 6.2 poll 的三种口味
+
+```mermaid
+flowchart TD
+    START([每轮 poll 开始]) --> Q{选哪种 poll}
+    Q -->|简单消费| A[poll<br/>回调每个 fragment]
+    Q -->|需要回压/暂停| B[controlledPoll<br/>回调返回 Action]
+    Q -->|按连续字节| C[blockPoll<br/>不关心 fragment 边界]
+
+    A --> A1[handler 无返回值]
+    B --> B1{Action?}
+    B1 --> CONT[CONTINUE 继续]
+    B1 --> BREAK[BREAK 停止, 下次跳过本条]
+    B1 --> ABORT[ABORT 停止, 下次重来]
+    B1 --> COMMIT[COMMIT 提交继续]
+    C --> C1[通常用于 Archive/落盘]
+
+    style A fill:#caffbf
+    style B fill:#fdffb6
+    style C fill:#a0c4ff
+```
+
 
 ```java
 // 1) 最常用：每个 fragment 都回调

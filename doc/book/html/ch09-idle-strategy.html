@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 09 章 · IdleStrategy 与低延迟循环设计</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-light.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/index.min.js"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose" });
+</script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+                 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2em 1em 4em;
+    background: #fafafa;
+    color: #24292f;
+  }
+  .markdown-body {
+    background: #ffffff;
+    padding: 2.5em 3em;
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+  }
+  .markdown-body pre {
+    background: #f6f8fa !important;
+  }
+  .markdown-body pre.mermaid {
+    background: transparent !important;
+    text-align: center;
+    padding: 1em;
+  }
+  nav.chapter-nav {
+    display: flex;
+    justify-content: space-between;
+    padding: 1em;
+    margin-bottom: 1.5em;
+    background: #eef2f7;
+    border-radius: 8px;
+    font-size: 0.95em;
+  }
+  nav.chapter-nav a {
+    color: #0969da;
+    text-decoration: none;
+  }
+  nav.chapter-nav a:hover { text-decoration: underline; }
+  nav.chapter-nav .nav-link { min-width: 30%; }
+  nav.chapter-nav .nav-link.next { text-align: right; }
+  nav.chapter-nav .nav-link.home { text-align: center; }
+</style>
+</head>
+<body>
+<article class="markdown-body">
+<nav class="chapter-nav"><a href="ch08-offer-backpressure.html" class="nav-link">← 第 08 章 · offer 返回值与 Back Pressure</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch10-agrona-buffer.html" class="nav-link next">第 10 章 · Agrona DirectBuffer 与零 GC 编程 →</a></nav>
+<h1 id="09-idlestrategy">第 09 章 · IdleStrategy 与低延迟循环设计</h1>
+<h2 id="_1">学习目标</h2>
+<ul>
+<li>记住 Agrona 提供的 5 种 IdleStrategy 的策略取舍；</li>
+<li>会为不同场景选择合适的策略；</li>
+<li>掌握 <code>idle(work)</code> 模式，避免"忙等 100% CPU"和"睡太久漏消息"两个极端；</li>
+<li>了解 driver 内部 IdleStrategy 的配置方式。</li>
+</ul>
+<h2 id="vs-cpu">本章速览：延迟 vs CPU 的取舍谱</h2>
+<div class="codehilite"><pre><span></span><code>   延迟低               CPU 高
+   ─────────────────────────▶
+   NoOp / BusySpin      Yielding    Backoff       Sleeping
+     │                    │           │              │
+   100% CPU            100% CPU    自适应         低 CPU
+   亚微秒              μs 级       混合           ms 级延迟
+   适合绑核            适合竞争    ★生产默认      适合后台
+
+   ◀─────────────────────────
+   CPU 高                延迟高
+</code></pre></div>
+
+<pre class="mermaid">
+flowchart TD
+    START[消费循环<br/>while running] --> POLL[poll]
+    POLL --> W{work?}
+    W -->|>0 有消息| RESET[reset 策略<br/>回到激进]
+    W -->|=0 没消息| IDLE[idle 让 CPU]
+    IDLE --> DECIDE{策略类型}
+    DECIDE -->|NoOp| N1[什么也不做]
+    DECIDE -->|BusySpin| N2[Thread.onSpinWait]
+    DECIDE -->|Yielding| N3[Thread.yield]
+    DECIDE -->|Sleeping| N4[parkNanos]
+    DECIDE -->|Backoff| N5[逐级退让]
+    N5 --> LEVELS[spin → yield → park 1μs → 2μs → ... → 100μs]
+    RESET --> POLL
+    N1 --> POLL
+    N2 --> POLL
+    N3 --> POLL
+    N4 --> POLL
+    LEVELS --> POLL
+    style RESET fill:#caffbf
+    style N5 fill:#a0c4ff
+    style LEVELS fill:#fdffb6
+</pre>
+
+<h2 id="91-aeron">9.1 Aeron 消费循环的骨架</h2>
+<div class="codehilite"><pre><span></span><code><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="n">running</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">work</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">subscription</span><span class="p">.</span><span class="na">poll</span><span class="p">(</span><span class="n">handler</span><span class="p">,</span><span class="w"> </span><span class="n">LIMIT</span><span class="p">);</span>
+<span class="w">    </span><span class="n">idleStrategy</span><span class="p">.</span><span class="na">idle</span><span class="p">(</span><span class="n">work</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><code>idle(work)</code> 的语义：<strong>"你告诉我这次干了多少活，我决定要不要让 CPU 歇一下"</strong>。</p>
+<ul>
+<li><code>work &gt; 0</code>：策略 reset 到最激进状态</li>
+<li><code>work == 0</code>：递进式退让（先自旋，再 yield，再 park）</li>
+</ul>
+<h2 id="92-idlestrategy">9.2 五种 IdleStrategy</h2>
+<table>
+<thead>
+<tr>
+<th>类</th>
+<th>行为</th>
+<th>CPU</th>
+<th>延迟</th>
+<th>场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>NoOpIdleStrategy</code></td>
+<td>完全不让 CPU（不调 onSpinWait）</td>
+<td>100%</td>
+<td>极低</td>
+<td>绑核忙循环</td>
+</tr>
+<tr>
+<td><code>BusySpinIdleStrategy</code></td>
+<td><code>Thread.onSpinWait()</code></td>
+<td>100%</td>
+<td>极低</td>
+<td>绑核忙循环，但对 SMT 友好</td>
+</tr>
+<tr>
+<td><code>YieldingIdleStrategy</code></td>
+<td><code>Thread.yield()</code></td>
+<td>100%</td>
+<td>低</td>
+<td>有其他线程竞争但不能等</td>
+</tr>
+<tr>
+<td><code>SleepingIdleStrategy(ns)</code></td>
+<td><code>LockSupport.parkNanos(ns)</code></td>
+<td>低</td>
+<td>与 ns 成正比</td>
+<td>后台任务、日志</td>
+</tr>
+<tr>
+<td><code>SleepingMillisIdleStrategy(ms)</code></td>
+<td><code>Thread.sleep(ms)</code></td>
+<td>极低</td>
+<td>与 ms 成正比</td>
+<td>慢管道</td>
+</tr>
+<tr>
+<td><code>BackoffIdleStrategy(spin, yield, minPark, maxPark)</code></td>
+<td>分阶段：先 spin → yield → park 逐渐涨到 maxPark</td>
+<td>自适应</td>
+<td>中等</td>
+<td><strong>生产默认</strong></td>
+</tr>
+</tbody>
+</table>
+<h2 id="93-backoffidlestrategy">9.3 BackoffIdleStrategy 详解</h2>
+<div class="codehilite"><pre><span></span><code><span class="n">IdleStrategy</span><span class="w"> </span><span class="n">idle</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">BackoffIdleStrategy</span><span class="p">(</span>
+<span class="w">    </span><span class="mi">100</span><span class="p">,</span><span class="w">                                    </span><span class="c1">// maxSpins  : 连续空转多少次后进入 yield</span>
+<span class="w">    </span><span class="mi">10</span><span class="p">,</span><span class="w">                                     </span><span class="c1">// maxYields : 连续 yield 多少次后进入 park</span>
+<span class="w">    </span><span class="n">TimeUnit</span><span class="p">.</span><span class="na">MICROSECONDS</span><span class="p">.</span><span class="na">toNanos</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span><span class="w">       </span><span class="c1">// minParkNs</span>
+<span class="w">    </span><span class="n">TimeUnit</span><span class="p">.</span><span class="na">MICROSECONDS</span><span class="p">.</span><span class="na">toNanos</span><span class="p">(</span><span class="mi">100</span><span class="p">));</span><span class="w">    </span><span class="c1">// maxParkNs</span>
+</code></pre></div>
+
+<p>执行路径：</p>
+<div class="codehilite"><pre><span></span><code>work&gt;0 → reset
+work==0 first  100 次  → onSpinWait
+      then    10  次  → Thread.yield()
+      then    park 1μs
+      then    park 2μs
+      then    park 4μs
+      ...
+      直到 park maxParkNs=100μs
+</code></pre></div>
+
+<p>一旦 <code>work &gt; 0</code>，立刻回到"最激进"。</p>
+<h2 id="94">9.4 场景选择矩阵</h2>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>选择</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>撮合引擎主循环，绑核</td>
+<td><code>NoOpIdleStrategy</code></td>
+</tr>
+<tr>
+<td>行情 gateway，绑核</td>
+<td><code>BusySpinIdleStrategy</code></td>
+</tr>
+<tr>
+<td>一般低延迟微服务</td>
+<td><code>BackoffIdleStrategy(100, 10, 1μs, 100μs)</code></td>
+</tr>
+<tr>
+<td>后台监控 / recorder</td>
+<td><code>BackoffIdleStrategy(10, 5, 100μs, 10ms)</code></td>
+</tr>
+<tr>
+<td>完全非关键</td>
+<td><code>SleepingIdleStrategy(1ms)</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="95-driver-idlestrategy">9.5 driver 内部 IdleStrategy</h2>
+<p>MediaDriver 里有 3 类线程，各自可以配自己的 IdleStrategy：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">MediaDriver</span><span class="p">.</span><span class="na">Context</span><span class="w"> </span><span class="n">ctx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">MediaDriver</span><span class="p">.</span><span class="na">Context</span><span class="p">()</span>
+<span class="w">    </span><span class="p">.</span><span class="na">threadingMode</span><span class="p">(</span><span class="n">ThreadingMode</span><span class="p">.</span><span class="na">DEDICATED</span><span class="p">)</span>
+<span class="w">    </span><span class="p">.</span><span class="na">conductorIdleStrategy</span><span class="p">(</span><span class="k">new</span><span class="w"> </span><span class="n">BackoffIdleStrategy</span><span class="p">(...))</span>
+<span class="w">    </span><span class="p">.</span><span class="na">senderIdleStrategy</span><span class="p">(</span><span class="k">new</span><span class="w"> </span><span class="n">NoOpIdleStrategy</span><span class="p">())</span>
+<span class="w">    </span><span class="p">.</span><span class="na">receiverIdleStrategy</span><span class="p">(</span><span class="k">new</span><span class="w"> </span><span class="n">NoOpIdleStrategy</span><span class="p">());</span>
+</code></pre></div>
+
+<p>高频行情场景常见配置：
+- Sender / Receiver：<code>NoOpIdleStrategy</code> + 绑核
+- Conductor：<code>BackoffIdleStrategy</code>（不关键，让出 CPU）</p>
+<h2 id="96-composite-agent-agentrunner">9.6 Composite Agent + AgentRunner</h2>
+<p>Aeron 的低延迟世界里，一个线程往往同时干"消费 + 发送 + 定时器"，模式是：</p>
+<div class="codehilite"><pre><span></span><code><span class="kd">class</span> <span class="nc">MyAgent</span><span class="w"> </span><span class="kd">implements</span><span class="w"> </span><span class="n">Agent</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="nf">doWork</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kt">int</span><span class="w"> </span><span class="n">work</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">        </span><span class="n">work</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">subscription</span><span class="p">.</span><span class="na">poll</span><span class="p">(</span><span class="n">handler</span><span class="p">,</span><span class="w"> </span><span class="mi">20</span><span class="p">);</span>
+<span class="w">        </span><span class="n">work</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">pollTimers</span><span class="p">();</span>
+<span class="w">        </span><span class="n">work</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">flushOutputs</span><span class="p">();</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">work</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="n">String</span><span class="w"> </span><span class="nf">roleName</span><span class="p">()</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="s">&quot;market-worker&quot;</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+
+<span class="n">AgentRunner</span><span class="w"> </span><span class="n">runner</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">AgentRunner</span><span class="p">(</span>
+<span class="w">    </span><span class="k">new</span><span class="w"> </span><span class="n">BackoffIdleStrategy</span><span class="p">(</span><span class="mi">100</span><span class="p">,</span><span class="w"> </span><span class="mi">10</span><span class="p">,</span><span class="w"> </span><span class="mi">1_000</span><span class="p">,</span><span class="w"> </span><span class="mi">100_000</span><span class="p">),</span>
+<span class="w">    </span><span class="n">Throwable</span><span class="p">::</span><span class="n">printStackTrace</span><span class="p">,</span>
+<span class="w">    </span><span class="kc">null</span><span class="p">,</span>
+<span class="w">    </span><span class="k">new</span><span class="w"> </span><span class="n">MyAgent</span><span class="p">());</span>
+
+<span class="n">AgentRunner</span><span class="p">.</span><span class="na">startOnThread</span><span class="p">(</span><span class="n">runner</span><span class="p">);</span>
+</code></pre></div>
+
+<p>好处：
+- IdleStrategy 由 AgentRunner 自动管
+- 优雅停止：<code>runner.close()</code>
+- 与 Aeron/Archive 官方 sample 完全对齐（cookbook 中大量使用）</p>
+<h2 id="97">9.7 常见误区</h2>
+<ol>
+<li><strong>一开始就用 BusySpin</strong>：把 CPU 打满，后台线程都跑不了 → 除非绑核否则用 Backoff。</li>
+<li><strong>每次 poll 都 sleep(1)</strong>：延迟 500μs+，几乎失去 Aeron 的优势。</li>
+<li><strong><code>idle(work)</code> 传常量</strong>：想想第一次要不要 reset，逻辑就坏了。</li>
+<li><strong>在 handler 里 sleep</strong>：影响本 poll 的 fragmentLimit 处理速度，同时会阻塞其他 Image。</li>
+</ol>
+<h2 id="98-agent">9.8 一段"复合 agent"示例</h2>
+<div class="codehilite"><pre><span></span><code><span class="kd">class</span> <span class="nc">MarketWorker</span><span class="w"> </span><span class="kd">implements</span><span class="w"> </span><span class="n">Agent</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="n">Subscription</span><span class="w"> </span><span class="n">tickSub</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="n">Publication</span><span class="w">  </span><span class="n">aggPub</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="n">UnsafeBuffer</span><span class="w"> </span><span class="n">scratch</span><span class="p">;</span>
+
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="nf">doWork</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kt">int</span><span class="w"> </span><span class="n">w</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">        </span><span class="n">w</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">tickSub</span><span class="p">.</span><span class="na">poll</span><span class="p">(</span><span class="k">this</span><span class="p">::</span><span class="n">handleTick</span><span class="p">,</span><span class="w"> </span><span class="mi">20</span><span class="p">);</span>
+<span class="w">        </span><span class="n">w</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">publishAggregatesIfDue</span><span class="p">();</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">w</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">handleTick</span><span class="p">(</span><span class="n">DirectBuffer</span><span class="w"> </span><span class="n">b</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">o</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">l</span><span class="p">,</span><span class="w"> </span><span class="n">Header</span><span class="w"> </span><span class="n">h</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 汇总</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="nf">publishAggregatesIfDue</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">due</span><span class="p">())</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">        </span><span class="kt">long</span><span class="w"> </span><span class="n">r</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">aggPub</span><span class="p">.</span><span class="na">offer</span><span class="p">(</span><span class="n">scratch</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">aggLen</span><span class="p">);</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">r</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="o">?</span><span class="w"> </span><span class="mi">1</span><span class="w"> </span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="n">String</span><span class="w"> </span><span class="nf">roleName</span><span class="p">()</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="s">&quot;market-worker&quot;</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>一个线程，Backoff idle，既消费又生产，是低延迟系统最经典的骨架。</p>
+<h2 id="99">9.9 小结</h2>
+<ul>
+<li>IdleStrategy 是"如何让 CPU 歇"的一等公民；</li>
+<li>BackoffIdleStrategy 是生产默认；</li>
+<li>Aeron 提供的 AgentRunner + Agent 抽象让 idle 逻辑消失在框架里；</li>
+<li>Ch12 (SBE) / Ch25 (行情总线) 会大量复用这套 pattern。</li>
+</ul>
+<nav class="chapter-nav"><a href="ch08-offer-backpressure.html" class="nav-link">← 第 08 章 · offer 返回值与 Back Pressure</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch10-agrona-buffer.html" class="nav-link next">第 10 章 · Agrona DirectBuffer 与零 GC 编程 →</a></nav>
+</article>
+<script>
+  // 高亮所有非 mermaid 代码块
+  document.querySelectorAll('pre code:not(.language-mermaid)').forEach(el => {
+    if (window.hljs) hljs.highlightElement(el);
+  });
+</script>
+</body>
+</html>

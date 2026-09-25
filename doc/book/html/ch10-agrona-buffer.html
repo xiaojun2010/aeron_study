@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 10 章 · Agrona DirectBuffer 与零 GC 编程</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-light.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/index.min.js"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose" });
+</script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+                 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2em 1em 4em;
+    background: #fafafa;
+    color: #24292f;
+  }
+  .markdown-body {
+    background: #ffffff;
+    padding: 2.5em 3em;
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+  }
+  .markdown-body pre {
+    background: #f6f8fa !important;
+  }
+  .markdown-body pre.mermaid {
+    background: transparent !important;
+    text-align: center;
+    padding: 1em;
+  }
+  nav.chapter-nav {
+    display: flex;
+    justify-content: space-between;
+    padding: 1em;
+    margin-bottom: 1.5em;
+    background: #eef2f7;
+    border-radius: 8px;
+    font-size: 0.95em;
+  }
+  nav.chapter-nav a {
+    color: #0969da;
+    text-decoration: none;
+  }
+  nav.chapter-nav a:hover { text-decoration: underline; }
+  nav.chapter-nav .nav-link { min-width: 30%; }
+  nav.chapter-nav .nav-link.next { text-align: right; }
+  nav.chapter-nav .nav-link.home { text-align: center; }
+</style>
+</head>
+<body>
+<article class="markdown-body">
+<nav class="chapter-nav"><a href="ch09-idle-strategy.html" class="nav-link">← 第 09 章 · IdleStrategy 与低延迟循环设计</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch11-fragment-assembler.html" class="nav-link next">第 11 章 · 大消息与 FragmentAssembler →</a></nav>
+<h1 id="10-agrona-directbuffer-gc">第 10 章 · Agrona DirectBuffer 与零 GC 编程</h1>
+<h2 id="_1">学习目标</h2>
+<ul>
+<li>分清 <code>DirectBuffer</code> / <code>MutableDirectBuffer</code> / <code>AtomicBuffer</code> / <code>UnsafeBuffer</code>；</li>
+<li>掌握 UnsafeBuffer 的构造、字段访问、字节序控制；</li>
+<li>学会用 <code>ExpandableArrayBuffer</code> 应对未知大小消息；</li>
+<li>建立"零分配"思维：DirectBuffer + 复用 + 预分配。</li>
+</ul>
+<h2 id="buffer">本章速览：Buffer 家族</h2>
+<pre class="mermaid">
+classDiagram
+    class DirectBuffer {
+        <<interface>>
+        +getInt(offset)
+        +getLong(offset)
+        +getBytes(offset, dst)
+    }
+    class MutableDirectBuffer {
+        <<interface>>
+        +putInt(offset, value)
+        +putLong(offset, value)
+        +putBytes(offset, src)
+    }
+    class AtomicBuffer {
+        <<interface>>
+        +putIntOrdered
+        +compareAndSetInt
+    }
+    class UnsafeBuffer {
+        + heap 数组
+        + direct ByteBuffer
+        + 原生地址
+    }
+    class ExpandableArrayBuffer {
+        + 可自动扩容
+        + 慢路径用
+    }
+    DirectBuffer <|-- MutableDirectBuffer
+    MutableDirectBuffer <|-- AtomicBuffer
+    AtomicBuffer <|.. UnsafeBuffer
+    MutableDirectBuffer <|.. ExpandableArrayBuffer
+</pre>
+
+<p><strong>99% 场景</strong>：直接用 <code>UnsafeBuffer(ByteBuffer.allocateDirect(N))</code>。</p>
+<h2 id="101-agrona">10.1 Agrona 是什么</h2>
+<p>Agrona 是 Aeron 的姊妹项目，提供：
+- 高性能 buffer / concurrent data structure
+- IdleStrategy
+- Agent / AgentRunner 框架
+- Timer wheel、one-to-one/many queue
+- 无 GC 的集合类（Long2ObjectHashMap 等）</p>
+<p>Aeron 的 <code>aeron-client</code> 会自动依赖 Agrona，你无须单独引入。</p>
+<h2 id="102-buffer">10.2 Buffer 家族</h2>
+<div class="codehilite"><pre><span></span><code>DirectBuffer               只读接口
+     ↑
+MutableDirectBuffer        可写接口
+     ↑
+AtomicBuffer               支持 volatile / CAS 语义
+     ↑
+UnsafeBuffer               具体实现（默认）
+</code></pre></div>
+
+<p>日常 99% 用 <code>UnsafeBuffer</code>。它可以包装：
+- <code>byte[]</code>（堆上）
+- <code>ByteBuffer.allocateDirect(n)</code>（堆外 direct）
+- 直接指定 memory address（native memory）</p>
+<div class="codehilite"><pre><span></span><code><span class="n">UnsafeBuffer</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">UnsafeBuffer</span><span class="p">(</span><span class="k">new</span><span class="w"> </span><span class="kt">byte</span><span class="o">[</span><span class="mi">256</span><span class="o">]</span><span class="p">);</span>
+<span class="n">UnsafeBuffer</span><span class="w"> </span><span class="n">b</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">UnsafeBuffer</span><span class="p">(</span><span class="n">ByteBuffer</span><span class="p">.</span><span class="na">allocateDirect</span><span class="p">(</span><span class="mi">256</span><span class="p">));</span>
+<span class="n">UnsafeBuffer</span><span class="w"> </span><span class="n">c</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">UnsafeBuffer</span><span class="p">(</span><span class="n">mmapAddress</span><span class="p">,</span><span class="w"> </span><span class="n">mmapLength</span><span class="p">);</span>
+</code></pre></div>
+
+<p>Aeron 里所有 Publication 相关的 buffer 建议用 direct（避免 JVM 把它 copy 到 native）。</p>
+<h2 id="103-api">10.3 常用读写 API</h2>
+<div class="codehilite"><pre><span></span><code><span class="n">UnsafeBuffer</span><span class="w"> </span><span class="n">buf</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">UnsafeBuffer</span><span class="p">(</span><span class="n">ByteBuffer</span><span class="p">.</span><span class="na">allocateDirect</span><span class="p">(</span><span class="mi">64</span><span class="p">));</span>
+
+<span class="c1">// 写</span>
+<span class="n">buf</span><span class="p">.</span><span class="na">putInt</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">12345</span><span class="p">);</span>
+<span class="n">buf</span><span class="p">.</span><span class="na">putLong</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span><span class="w"> </span><span class="n">System</span><span class="p">.</span><span class="na">nanoTime</span><span class="p">());</span>
+<span class="n">buf</span><span class="p">.</span><span class="na">putDouble</span><span class="p">(</span><span class="mi">12</span><span class="p">,</span><span class="w"> </span><span class="mf">3.14</span><span class="p">);</span>
+<span class="n">buf</span><span class="p">.</span><span class="na">putBytes</span><span class="p">(</span><span class="mi">20</span><span class="p">,</span><span class="w"> </span><span class="n">someBytes</span><span class="p">);</span>
+
+<span class="c1">// 读</span>
+<span class="kt">int</span><span class="w">    </span><span class="n">a</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">buf</span><span class="p">.</span><span class="na">getInt</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+<span class="kt">long</span><span class="w">   </span><span class="n">b</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">buf</span><span class="p">.</span><span class="na">getLong</span><span class="p">(</span><span class="mi">4</span><span class="p">);</span>
+<span class="kt">double</span><span class="w"> </span><span class="n">c</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">buf</span><span class="p">.</span><span class="na">getDouble</span><span class="p">(</span><span class="mi">12</span><span class="p">);</span>
+<span class="kt">byte</span><span class="o">[]</span><span class="w"> </span><span class="n">d</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="kt">byte</span><span class="o">[</span><span class="mi">16</span><span class="o">]</span><span class="p">;</span>
+<span class="n">buf</span><span class="p">.</span><span class="na">getBytes</span><span class="p">(</span><span class="mi">20</span><span class="p">,</span><span class="w"> </span><span class="n">d</span><span class="p">);</span>
+</code></pre></div>
+
+<p>字节序默认是 <strong>native</strong>（Little-Endian on x86/ARM）。跨平台或跨语言时要显式：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">buf</span><span class="p">.</span><span class="na">putIntAscii</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">12345</span><span class="p">);</span><span class="w">                              </span><span class="c1">// 不带字节序</span>
+<span class="n">buf</span><span class="p">.</span><span class="na">putInt</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">12345</span><span class="p">,</span><span class="w"> </span><span class="n">ByteOrder</span><span class="p">.</span><span class="na">BIG_ENDIAN</span><span class="p">);</span><span class="w">             </span><span class="c1">// 显式 BE</span>
+</code></pre></div>
+
+<h2 id="104-string-varchar">10.4 String / VarChar 处理</h2>
+<p>Aeron 的 buffer 没有原生 varchar 概念，需要自己写：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1">// 写：长度 + UTF-8 字节</span>
+<span class="kt">byte</span><span class="o">[]</span><span class="w"> </span><span class="n">bytes</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">str</span><span class="p">.</span><span class="na">getBytes</span><span class="p">(</span><span class="n">StandardCharsets</span><span class="p">.</span><span class="na">UTF_8</span><span class="p">);</span>
+<span class="n">buf</span><span class="p">.</span><span class="na">putInt</span><span class="p">(</span><span class="n">offset</span><span class="p">,</span><span class="w"> </span><span class="n">bytes</span><span class="p">.</span><span class="na">length</span><span class="p">);</span>
+<span class="n">buf</span><span class="p">.</span><span class="na">putBytes</span><span class="p">(</span><span class="n">offset</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span><span class="w"> </span><span class="n">bytes</span><span class="p">);</span>
+<span class="kt">int</span><span class="w"> </span><span class="n">newOffset</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">offset</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">4</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">bytes</span><span class="p">.</span><span class="na">length</span><span class="p">;</span>
+
+<span class="c1">// 读</span>
+<span class="kt">int</span><span class="w"> </span><span class="n">len</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">buf</span><span class="p">.</span><span class="na">getInt</span><span class="p">(</span><span class="n">offset</span><span class="p">);</span>
+<span class="kt">byte</span><span class="o">[]</span><span class="w"> </span><span class="n">bytes</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="kt">byte</span><span class="o">[</span><span class="n">len</span><span class="o">]</span><span class="p">;</span>
+<span class="n">buf</span><span class="p">.</span><span class="na">getBytes</span><span class="p">(</span><span class="n">offset</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span><span class="w"> </span><span class="n">bytes</span><span class="p">);</span>
+<span class="n">String</span><span class="w"> </span><span class="n">str</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">String</span><span class="p">(</span><span class="n">bytes</span><span class="p">,</span><span class="w"> </span><span class="n">StandardCharsets</span><span class="p">.</span><span class="na">UTF_8</span><span class="p">);</span>
+</code></pre></div>
+
+<p>更高效的做法是用 SBE 的 <code>varData</code> 类型（Ch12），或者用固定长度字符（例如 symbol 最长 12 字符，直接 putBytes 12 字节）。</p>
+<h2 id="105-buffer">10.5 复用 buffer</h2>
+<p>低延迟原则 #1：<strong>不要在热路径 new 对象</strong>。</p>
+<div class="codehilite"><pre><span></span><code><span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">MarketPublisher</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="n">Publication</span><span class="w"> </span><span class="n">pub</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="n">UnsafeBuffer</span><span class="w"> </span><span class="n">buffer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">UnsafeBuffer</span><span class="p">(</span><span class="n">ByteBuffer</span><span class="p">.</span><span class="na">allocateDirect</span><span class="p">(</span><span class="mi">256</span><span class="p">));</span><span class="w"> </span><span class="c1">// 分配一次</span>
+
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">publish</span><span class="p">(</span><span class="kt">long</span><span class="w"> </span><span class="n">ts</span><span class="p">,</span><span class="w"> </span><span class="kt">double</span><span class="w"> </span><span class="n">bid</span><span class="p">,</span><span class="w"> </span><span class="kt">double</span><span class="w"> </span><span class="n">ask</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">buffer</span><span class="p">.</span><span class="na">putLong</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">ts</span><span class="p">);</span>
+<span class="w">        </span><span class="n">buffer</span><span class="p">.</span><span class="na">putDouble</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span><span class="w"> </span><span class="n">bid</span><span class="p">);</span>
+<span class="w">        </span><span class="n">buffer</span><span class="p">.</span><span class="na">putDouble</span><span class="p">(</span><span class="mi">16</span><span class="p">,</span><span class="w"> </span><span class="n">ask</span><span class="p">);</span>
+<span class="w">        </span><span class="kt">long</span><span class="w"> </span><span class="n">r</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">pub</span><span class="p">.</span><span class="na">offer</span><span class="p">(</span><span class="n">buffer</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">24</span><span class="p">);</span>
+<span class="w">        </span><span class="c1">// ... 处理返回值</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h2 id="106-expandablearraybuffer-expandabledirectbytebuffer">10.6 ExpandableArrayBuffer / ExpandableDirectByteBuffer</h2>
+<p>如果消息大小事先未知（比如 SBE 里有 varData），Agrona 提供可自动扩容的 buffer：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">ExpandableArrayBuffer</span><span class="w"> </span><span class="n">buf</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">ExpandableArrayBuffer</span><span class="p">(</span><span class="mi">1024</span><span class="p">);</span>
+<span class="n">buf</span><span class="p">.</span><span class="na">putBytes</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">someLongPayload</span><span class="p">);</span><span class="w">   </span><span class="c1">// 超过 1024 会自动扩容</span>
+</code></pre></div>
+
+<p>热路径不推荐，因为可能触发数组拷贝；用于慢路径 / 日志 / 测试。</p>
+<h2 id="107-atomic">10.7 Atomic 语义</h2>
+<p><code>UnsafeBuffer</code> 支持 volatile / ordered / release 三种语义的读写，用于无锁数据结构或跨线程 flag：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">buf</span><span class="p">.</span><span class="na">putIntVolatile</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span><span class="w">       </span><span class="c1">// release + StoreLoad</span>
+<span class="kt">int</span><span class="w"> </span><span class="n">v</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">buf</span><span class="p">.</span><span class="na">getIntVolatile</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span><span class="w">  </span><span class="c1">// acquire + LoadLoad</span>
+<span class="n">buf</span><span class="p">.</span><span class="na">putIntOrdered</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">);</span><span class="w">        </span><span class="c1">// release only（更快）</span>
+<span class="n">buf</span><span class="p">.</span><span class="na">compareAndSetInt</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">);</span><span class="w">  </span><span class="c1">// CAS</span>
+</code></pre></div>
+
+<p>Aeron 内部大量用 <code>putIntOrdered</code> 做 producer/consumer 同步。</p>
+<h2 id="108-direct-vs-heap">10.8 Direct vs Heap 的性能差异</h2>
+<ul>
+<li>Direct：Aeron 内部零拷贝写入 term buffer，UDP 时 kernel 也能零拷贝</li>
+<li>Heap：offer 时 driver 必须拷贝到 term buffer</li>
+</ul>
+<p>因此发送 buffer 必须 direct。接收 handler 里的 <code>DirectBuffer</code> 天然是 direct（term buffer 的一段），你可以直接读，或者 copy 出来到 heap。</p>
+<p><strong>数据流对比</strong>：</p>
+<pre class="mermaid">
+flowchart LR
+    subgraph HEAP["heap 路径（多一次拷贝）"]
+        BH[业务对象] --> UBH["UnsafeBuffer<br/>on byte[]"]
+        UBH -->|memcpy| DIR1[Direct 中转]
+        DIR1 --> TB1[Term Buffer]
+    end
+    subgraph DIRECT["direct 路径（零拷贝）"]
+        BD[业务对象] --> UBD["UnsafeBuffer<br/>on DirectByteBuffer"]
+        UBD --> TB2[Term Buffer]
+    end
+    style HEAP fill:#fde8e8
+    style DIRECT fill:#caffbf
+</pre>
+
+<h2 id="109-jmh">10.9 测量：JMH 微基准</h2>
+<p>想验证"复用 UnsafeBuffer 比每次 new 更快"，用 JMH：</p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@Benchmark</span>
+<span class="kd">public</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="nf">directReuse</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">reusedBuf</span><span class="p">.</span><span class="na">putLong</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">ts</span><span class="o">++</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">reusedBuf</span><span class="p">.</span><span class="na">getLong</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="nd">@Benchmark</span>
+<span class="kd">public</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="nf">directNew</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">UnsafeBuffer</span><span class="w"> </span><span class="n">b</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">UnsafeBuffer</span><span class="p">(</span><span class="n">ByteBuffer</span><span class="p">.</span><span class="na">allocateDirect</span><span class="p">(</span><span class="mi">64</span><span class="p">));</span>
+<span class="w">    </span><span class="n">b</span><span class="p">.</span><span class="na">putLong</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">ts</span><span class="o">++</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">b</span><span class="p">.</span><span class="na">getLong</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>一般能看到 10~50 倍差距 + GC pause 消失。</p>
+<h2 id="1010">10.10 常见陷阱</h2>
+<ol>
+<li><strong>wrap 一个太大的 heap 数组</strong>：会 <code>System.arraycopy</code> 拷贝到 direct，测出来慢。</li>
+<li><strong>多线程共用 UnsafeBuffer</strong>：需要用 Atomic 系列 API 或加锁；<code>ExclusivePublication</code> + 自己的 buffer 是最简单的答案。</li>
+<li><strong>忘记 flip</strong>：Agrona 的 UnsafeBuffer <strong>没有 position/limit</strong>！你自己控制 offset / length。它不是 java.nio.ByteBuffer。</li>
+<li><strong>误以为 heap UnsafeBuffer 更快</strong>：小对象是的，但配 Aeron 还是要 direct。</li>
+</ol>
+<h2 id="1011">10.11 小结</h2>
+<ul>
+<li>UnsafeBuffer 是零 GC 编程的主战场</li>
+<li>一定要复用 + 预分配</li>
+<li>下一章讲大消息如何拆包 / 拼包</li>
+</ul>
+<nav class="chapter-nav"><a href="ch09-idle-strategy.html" class="nav-link">← 第 09 章 · IdleStrategy 与低延迟循环设计</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch11-fragment-assembler.html" class="nav-link next">第 11 章 · 大消息与 FragmentAssembler →</a></nav>
+</article>
+<script>
+  // 高亮所有非 mermaid 代码块
+  document.querySelectorAll('pre code:not(.language-mermaid)').forEach(el => {
+    if (window.hljs) hljs.highlightElement(el);
+  });
+</script>
+</body>
+</html>

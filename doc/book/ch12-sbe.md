@@ -7,6 +7,30 @@
 - 学会用 SBE + `tryClaim` 做零拷贝 encoding；
 - 认识 SBE 与 Aeron 生态的深度绑定。
 
+## 本章速览：SBE + Aeron 的黄金路径
+
+```mermaid
+flowchart LR
+    XML[SBE schema<br/>XML] -->|sbe-tool 生成| CODE[Encoder/Decoder<br/>Java 类]
+    subgraph SEND["发送端（零拷贝）"]
+        BUS1[业务字段] --> ENC[Encoder]
+        CLAIM[tryClaim 拿到<br/>term buffer 一段] --> ENC
+        ENC -->|直接写到 term buffer| CMT[commit]
+    end
+    subgraph RECV["接收端（零拷贝）"]
+        FRAG[fragment 到达] --> DEC[Decoder wrap]
+        DEC --> HDR[templateId 分发]
+        HDR --> BUS2[业务字段]
+    end
+    CODE -.-> ENC
+    CODE -.-> DEC
+    style ENC fill:#caffbf
+    style DEC fill:#caffbf
+    style CLAIM fill:#a0c4ff
+```
+
+**记忆**：`schema XML → 生成代码 → tryClaim + encoder → 直接写 term buffer → decoder wrap → 直接读字段`，全程零 object 分配。
+
 ## 12.1 SBE 是什么
 
 Simple Binary Encoding 是 FIX 协会牵头的二进制编码标准，Aeron 作者 Martin Thompson 也是核心贡献者。特点：
@@ -147,7 +171,30 @@ switch (header.templateId()) {
 }
 ```
 
-## 12.9 SBE 在 Aeron 生态
+## 12.9 SBE message 布局示意
+
+以第 12.3 节的 MarketTick 为例，在 buffer 里的字节布局：
+
+```
+偏移: 0         8              12          20         28         36     40
+     ┌─────────┬──────────────┬────────────┬──────────┬──────────┬──────┬────
+     │Header 8B│ timestamp    │ symbolId   │ bidPrice │ askPrice │ bidSz│...
+     │         │   int64      │   int32    │  int64   │  int64   │ int32│
+     └─────────┴──────────────┴────────────┴──────────┴──────────┴──────┴────
+       ▲             ▲                                                   ▲
+       │             │                                                   │
+   blockLen        字段 1                                             blockLength
+   templateId
+   schemaId
+   version
+```
+
+**优点**：
+- 每个字段偏移固定 → 一次内存访问
+- 无 tag/varint → 无解析开销
+- 字段读写像访问结构体 field
+
+## 12.10 SBE 在 Aeron 生态
 
 - **Aeron Cluster**：内部所有 protocol message（session connect / vote / append）都是 SBE
 - **Aeron Archive**：Control protocol 全是 SBE
@@ -155,14 +202,14 @@ switch (header.templateId()) {
 
 因此 SBE 不是"可选加分项"，而是"深入 Aeron 必学"。
 
-## 12.10 常见陷阱
+## 12.11 常见陷阱
 
 1. **忘记写 header**：encoder.wrap 不带 header，decoder 就找不到 templateId。
 2. **不 commit 直接返回**：tryClaim 后必须 commit / abort。
 3. **decoder wrap 用错 blockLength**：跨版本时用 `header.blockLength()` 而不是常量。
 4. **varData / group 计算 length**：整体消息长度 = header + block + group + varData，不要固定长度。
 
-## 12.11 小结
+## 12.12 小结
 
 - SBE = 零 GC 的二进制协议
 - SBE + tryClaim + ExclusivePublication = Aeron 生态最快的发送路径

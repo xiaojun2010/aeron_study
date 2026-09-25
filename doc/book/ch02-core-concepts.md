@@ -6,6 +6,34 @@
 - 用一张图串起来 MediaDriver / Aeron / Channel / Stream ID / Publication / Subscription 的关系；
 - 分辨"看起来像 Kafka 但语义完全不同"的坑。
 
+## 本章速览
+
+```mermaid
+mindmap
+  root((Aeron 六件套))
+    MediaDriver::引擎
+      SHM
+      UDP
+    Aeron Client::入口
+      connect
+      addPublication
+      addSubscription
+    Channel::地址
+      aeron:ipc
+      aeron:udp
+    Stream ID::编号
+      1001
+      1002
+    Publication::发送端
+      offer
+      tryClaim
+    Subscription::接收端
+      poll
+      Image
+```
+
+**类比记忆**：Channel = 高速公路号（G4、G60），Stream ID = 车道号，Publication = 上匝道，Subscription = 下匝道，MediaDriver = 高速公路管理局，Aeron Client = 你的车。
+
 ## 2.1 六个概念
 
 ```
@@ -35,7 +63,33 @@ Aeron
 | Publication | `aeron.addPublication(channel, streamId)` |
 | Subscription | `aeron.addSubscription(channel, streamId)` |
 
-## 2.2 关系图
+## 2.2 一次消息的完整时序
+
+```mermaid
+sequenceDiagram
+    participant App1 as 业务进程 1
+    participant Pub as Publication
+    participant MD as MediaDriver<br/>(共享内存)
+    participant Sub as Subscription
+    participant App2 as 业务进程 2
+
+    App1->>Pub: aeron.addPublication(channel, stream)
+    App2->>Sub: aeron.addSubscription(channel, stream)
+    Pub-->>MD: 注册发送端
+    Sub-->>MD: 注册接收端
+    MD-->>Pub: isConnected=true
+    MD-->>Sub: isConnected=true
+
+    App1->>Pub: offer(buffer)
+    Pub->>MD: 写入 term buffer
+    Note over MD: 共享内存中就绪
+    App2->>Sub: poll(handler)
+    Sub->>MD: 读 term buffer
+    MD-->>Sub: 返回一段字节
+    Sub->>App2: handler.onFragment(buf,off,len)
+```
+
+## 2.3 关系图
 
 ```
                           Machine A
@@ -58,7 +112,7 @@ Aeron
 同机器：所有客户端通过共享内存与 MediaDriver 通信，走 `aeron:ipc` 走的就是这条路径。
 跨机器：MediaDriver 内部的 sender/receiver 线程会把 term buffer 中的数据发到 UDP socket。
 
-## 2.3 Channel + Stream ID = "在收发什么"
+## 2.4 Channel + Stream ID = "在收发什么"
 
 举例：
 
@@ -79,7 +133,7 @@ int fillStream       = 1003;
 
 Publisher 与 Subscriber 必须 **完全一致** 才能收到（channel 字符串一个字节都不能差）。
 
-## 2.4 与 Kafka 的容易搞混的点
+## 2.5 与 Kafka 的容易搞混的点
 
 | 直觉类比 | 真相 |
 |---|---|
@@ -89,7 +143,7 @@ Publisher 与 Subscriber 必须 **完全一致** 才能收到（channel 字符�
 | Stream ID = broker 主题 | ❌ 无 broker 概念，MediaDriver 只是传输引擎 |
 | 消费者用 group.id 分组 | ❌ Aeron 无 group 概念，负载均衡靠业务分片 |
 
-## 2.5 Aeron 与 "会话 (Session)"
+## 2.6 Aeron 与 "会话 (Session)"
 
 一个 Publication 每次 `addPublication` 都会分配一个新的 **sessionId**（32-bit）。
 Subscriber 侧看到 `header.sessionId()` 就能区分"这条消息来自哪个 Publisher 实例"。
@@ -103,7 +157,7 @@ Subscription 通过 sessionId 区分两条 image
 
 `Image` 是"某个 Publisher 会话在 Subscription 侧的镜像"，一个 Subscription 可能有多个 Image（多个 Publisher 同时打过来）。Ch13 会详细讲。
 
-## 2.6 心智模型：Aeron 是"共享 log + 独立读游标"
+## 2.7 心智模型：Aeron 是"共享 log + 独立读游标"
 
 ```
 Publisher.offer(msg)
@@ -124,7 +178,7 @@ Publisher.offer(msg)
 
 这就是 Aeron 广播语义 + 流控的物理基础。Ch13 讲 Term Buffer 内部，Ch14 讲流控。
 
-## 2.7 小结
+## 2.8 小结
 
 - 六个组件 + 一张图 = Aeron 的骨架
 - 不要生搬 Kafka 的心智模型

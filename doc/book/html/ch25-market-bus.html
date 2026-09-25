@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 25 章 · 综合案例：低延迟行情总线</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-light.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/index.min.js"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose" });
+</script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+                 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2em 1em 4em;
+    background: #fafafa;
+    color: #24292f;
+  }
+  .markdown-body {
+    background: #ffffff;
+    padding: 2.5em 3em;
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+  }
+  .markdown-body pre {
+    background: #f6f8fa !important;
+  }
+  .markdown-body pre.mermaid {
+    background: transparent !important;
+    text-align: center;
+    padding: 1em;
+  }
+  nav.chapter-nav {
+    display: flex;
+    justify-content: space-between;
+    padding: 1em;
+    margin-bottom: 1.5em;
+    background: #eef2f7;
+    border-radius: 8px;
+    font-size: 0.95em;
+  }
+  nav.chapter-nav a {
+    color: #0969da;
+    text-decoration: none;
+  }
+  nav.chapter-nav a:hover { text-decoration: underline; }
+  nav.chapter-nav .nav-link { min-width: 30%; }
+  nav.chapter-nav .nav-link.next { text-align: right; }
+  nav.chapter-nav .nav-link.home { text-align: center; }
+</style>
+</head>
+<body>
+<article class="markdown-body">
+<nav class="chapter-nav"><a href="ch24-troubleshooting.html" class="nav-link">← 第 24 章 · 常见错误与排错手册</a><a href="index.html" class="nav-link home">📖 目录</a><span class="nav-link next">&nbsp;</span></nav>
+<h1 id="25">第 25 章 · 综合案例：低延迟行情总线</h1>
+<h2 id="_1">学习目标</h2>
+<ul>
+<li>把前 24 章的所有概念串起来做一个可运行系统；</li>
+<li>学习端到端的低延迟系统组织方式：Netty ↔ Aeron ↔ Business ↔ Archive；</li>
+<li>拿到一份可以直接改造为生产版本的骨架。</li>
+</ul>
+<h2 id="4">本章速览：4 步演进路线</h2>
+<pre class="mermaid">
+flowchart LR
+    P1["Phase 1<br/>单机 IPC<br/>demo10 起步"] --> P2["Phase 2<br/>独立 JVM<br/>driver 常驻"]
+    P2 --> P3["Phase 3<br/>跨机 MDC<br/>多节点广播"]
+    P3 --> P4["Phase 4<br/>Cluster<br/>Raft 强一致"]
+
+    style P1 fill:#caffbf
+    style P2 fill:#fdffb6
+    style P3 fill:#ffd6a5
+    style P4 fill:#a0c4ff
+</pre>
+
+<p><strong>目标架构（Phase 4）</strong>：</p>
+<pre class="mermaid">
+flowchart TB
+    subgraph EX["交易所（互联网）"]
+        BN[Binance WS]
+        BY[Bybit WS]
+        GT[Gate WS]
+    end
+
+    subgraph GW["Gateway 层（Netty）"]
+        COL[MarketCollector<br/>归一化, SBE encode]
+    end
+
+    subgraph BUS["Aeron 总线"]
+        MD[MediaDriver<br/>IPC or MDC]
+        AR[Archive Recorder]
+    end
+
+    subgraph BIZ["业务层"]
+        STR[Strategy Engine]
+        RSK[Risk Engine]
+        REC[Recorder Backup]
+    end
+
+    BN --> COL
+    BY --> COL
+    GT --> COL
+    COL -->|Aeron Publication<br/>tryClaim + SBE| MD
+    MD --> STR
+    MD --> RSK
+    MD --> REC
+    MD --> AR
+    AR --> DISK[(SSD Archive)]
+
+    style COL fill:#a0c4ff
+    style MD fill:#caffbf
+    style STR fill:#fdffb6
+    style RSK fill:#fdffb6
+    style AR fill:#ffd6a5
+</pre>
+
+<h2 id="251">25.1 目标系统</h2>
+<div class="codehilite"><pre><span></span><code>     Binance / Bybit / Gate WebSocket
+              (跨互联网, Netty)
+                     │
+                     ▼
+        ┌─────────────────────┐
+        │  MarketCollector    │  Netty client + 归一化
+        │   (每交易所一个)     │
+        └────────┬────────────┘
+                 │ Aeron Publication (SBE MarketTick)
+                 │
+        ┌────────▼────────────┐
+        │  Aeron MediaDriver  │  IPC + MDC
+        └────────┬────────────┘
+                 │
+        ┌────────┴────────────────────────────┐
+        │        Aeron Subscriptions          │
+        │        (广播语义)                    │
+        └────┬──────────────┬────────────────┘
+             │              │
+        ┌────▼───┐    ┌─────▼─────┐    ┌─────────────┐
+        │Strategy│    │  Risk     │    │  Archive     │
+        │Engine  │    │  Engine   │    │  Recorder    │
+        └────────┘    └───────────┘    └──────────────┘
+</code></pre></div>
+
+<h2 id="252-schemasbe">25.2 消息 schema（SBE）</h2>
+<p><code>market-data.xml</code>：</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">&lt;sbe:message</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;MarketTick&quot;</span><span class="w"> </span><span class="na">id=</span><span class="s">&quot;100&quot;</span><span class="nt">&gt;</span>
+<span class="w">    </span><span class="nt">&lt;field</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;timestamp&quot;</span><span class="w">  </span><span class="na">id=</span><span class="s">&quot;1&quot;</span><span class="w"> </span><span class="na">type=</span><span class="s">&quot;int64&quot;</span><span class="nt">/&gt;</span>
+<span class="w">    </span><span class="nt">&lt;field</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;symbolId&quot;</span><span class="w">   </span><span class="na">id=</span><span class="s">&quot;2&quot;</span><span class="w"> </span><span class="na">type=</span><span class="s">&quot;int32&quot;</span><span class="nt">/&gt;</span>
+<span class="w">    </span><span class="nt">&lt;field</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;bidPrice&quot;</span><span class="w">   </span><span class="na">id=</span><span class="s">&quot;3&quot;</span><span class="w"> </span><span class="na">type=</span><span class="s">&quot;int64&quot;</span><span class="nt">/&gt;</span>
+<span class="w">    </span><span class="nt">&lt;field</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;askPrice&quot;</span><span class="w">   </span><span class="na">id=</span><span class="s">&quot;4&quot;</span><span class="w"> </span><span class="na">type=</span><span class="s">&quot;int64&quot;</span><span class="nt">/&gt;</span>
+<span class="w">    </span><span class="nt">&lt;field</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;bidSize&quot;</span><span class="w">    </span><span class="na">id=</span><span class="s">&quot;5&quot;</span><span class="w"> </span><span class="na">type=</span><span class="s">&quot;int32&quot;</span><span class="nt">/&gt;</span>
+<span class="w">    </span><span class="nt">&lt;field</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;askSize&quot;</span><span class="w">    </span><span class="na">id=</span><span class="s">&quot;6&quot;</span><span class="w"> </span><span class="na">type=</span><span class="s">&quot;int32&quot;</span><span class="nt">/&gt;</span>
+<span class="w">    </span><span class="nt">&lt;data</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;exchange&quot;</span><span class="w">    </span><span class="na">id=</span><span class="s">&quot;7&quot;</span><span class="w"> </span><span class="na">type=</span><span class="s">&quot;varAsciiEncoding&quot;</span><span class="nt">/&gt;</span>
+<span class="nt">&lt;/sbe:message&gt;</span>
+</code></pre></div>
+
+<p>Publisher 侧生成 <code>MarketTickEncoder</code>，Consumer 侧用 <code>MarketTickDecoder</code>。</p>
+<h2 id="253-collector">25.3 Collector 骨架</h2>
+<div class="codehilite"><pre><span></span><code><span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">MarketCollector</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="n">ExclusivePublication</span><span class="w"> </span><span class="n">publication</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="n">BufferClaim</span><span class="w"> </span><span class="n">claim</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">BufferClaim</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="n">MessageHeaderEncoder</span><span class="w"> </span><span class="n">header</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">MessageHeaderEncoder</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="n">MarketTickEncoder</span><span class="w"> </span><span class="n">encoder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">MarketTickEncoder</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="n">Long2ObjectHashMap</span><span class="o">&lt;</span><span class="n">Integer</span><span class="o">&gt;</span><span class="w"> </span><span class="n">symbolIdCache</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">Long2ObjectHashMap</span><span class="o">&lt;&gt;</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="n">IdleStrategy</span><span class="w"> </span><span class="n">idle</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">BackoffIdleStrategy</span><span class="p">(</span>
+<span class="w">        </span><span class="mi">100</span><span class="p">,</span><span class="w"> </span><span class="mi">10</span><span class="p">,</span><span class="w"> </span><span class="n">TimeUnit</span><span class="p">.</span><span class="na">MICROSECONDS</span><span class="p">.</span><span class="na">toNanos</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span><span class="w"> </span><span class="n">TimeUnit</span><span class="p">.</span><span class="na">MICROSECONDS</span><span class="p">.</span><span class="na">toNanos</span><span class="p">(</span><span class="mi">100</span><span class="p">));</span>
+
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="nf">MarketCollector</span><span class="p">(</span><span class="n">Aeron</span><span class="w"> </span><span class="n">aeron</span><span class="p">,</span><span class="w"> </span><span class="n">String</span><span class="w"> </span><span class="n">channel</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">streamId</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">this</span><span class="p">.</span><span class="na">publication</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">aeron</span><span class="p">.</span><span class="na">addExclusivePublication</span><span class="p">(</span><span class="n">channel</span><span class="p">,</span><span class="w"> </span><span class="n">streamId</span><span class="p">);</span>
+<span class="w">        </span><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">publication</span><span class="p">.</span><span class="na">isConnected</span><span class="p">())</span><span class="w"> </span><span class="n">idle</span><span class="p">.</span><span class="na">idle</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="cm">/** Netty EventLoop 里收到一条归一化的行情后调用 */</span>
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">onTick</span><span class="p">(</span><span class="n">NormalizedTick</span><span class="w"> </span><span class="n">tick</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kt">int</span><span class="w"> </span><span class="n">len</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">MessageHeaderEncoder</span><span class="p">.</span><span class="na">ENCODED_LENGTH</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">MarketTickEncoder</span><span class="p">.</span><span class="na">BLOCK_LENGTH</span>
+<span class="w">                </span><span class="o">+</span><span class="w"> </span><span class="n">MarketTickEncoder</span><span class="p">.</span><span class="na">exchangeHeaderLength</span><span class="p">()</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">tick</span><span class="p">.</span><span class="na">exchange</span><span class="p">.</span><span class="na">length</span><span class="p">();</span>
+
+<span class="w">        </span><span class="kt">long</span><span class="w"> </span><span class="n">r</span><span class="p">;</span>
+<span class="w">        </span><span class="k">while</span><span class="w"> </span><span class="p">((</span><span class="n">r</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">publication</span><span class="p">.</span><span class="na">tryClaim</span><span class="p">(</span><span class="n">len</span><span class="p">,</span><span class="w"> </span><span class="n">claim</span><span class="p">))</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">handleOfferFailure</span><span class="p">(</span><span class="n">r</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+
+<span class="w">        </span><span class="n">encoder</span><span class="p">.</span><span class="na">wrapAndApplyHeader</span><span class="p">(</span><span class="n">claim</span><span class="p">.</span><span class="na">buffer</span><span class="p">(),</span><span class="w"> </span><span class="n">claim</span><span class="p">.</span><span class="na">offset</span><span class="p">(),</span><span class="w"> </span><span class="n">header</span><span class="p">)</span>
+<span class="w">               </span><span class="p">.</span><span class="na">timestamp</span><span class="p">(</span><span class="n">tick</span><span class="p">.</span><span class="na">timestampNanos</span><span class="p">)</span>
+<span class="w">               </span><span class="p">.</span><span class="na">symbolId</span><span class="p">(</span><span class="n">symbolIdCache</span><span class="p">.</span><span class="na">getOrDefault</span><span class="p">(</span><span class="n">tick</span><span class="p">.</span><span class="na">symbolHash</span><span class="p">,</span><span class="w"> </span><span class="o">-</span><span class="mi">1</span><span class="p">))</span>
+<span class="w">               </span><span class="p">.</span><span class="na">bidPrice</span><span class="p">(</span><span class="n">tick</span><span class="p">.</span><span class="na">bidPriceRaw</span><span class="p">)</span>
+<span class="w">               </span><span class="p">.</span><span class="na">askPrice</span><span class="p">(</span><span class="n">tick</span><span class="p">.</span><span class="na">askPriceRaw</span><span class="p">)</span>
+<span class="w">               </span><span class="p">.</span><span class="na">bidSize</span><span class="p">(</span><span class="n">tick</span><span class="p">.</span><span class="na">bidSize</span><span class="p">)</span>
+<span class="w">               </span><span class="p">.</span><span class="na">askSize</span><span class="p">(</span><span class="n">tick</span><span class="p">.</span><span class="na">askSize</span><span class="p">)</span>
+<span class="w">               </span><span class="p">.</span><span class="na">exchange</span><span class="p">(</span><span class="n">tick</span><span class="p">.</span><span class="na">exchange</span><span class="p">);</span>
+<span class="w">        </span><span class="n">claim</span><span class="p">.</span><span class="na">commit</span><span class="p">();</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">handleOfferFailure</span><span class="p">(</span><span class="kt">long</span><span class="w"> </span><span class="n">r</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">r</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">Publication</span><span class="p">.</span><span class="na">BACK_PRESSURED</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">metrics</span><span class="p">.</span><span class="na">backPressured</span><span class="p">.</span><span class="na">increment</span><span class="p">();</span>
+<span class="w">            </span><span class="c1">// 策略：丢弃老 tick，业务上可以接受</span>
+<span class="w">            </span><span class="k">return</span><span class="p">;</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">r</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">Publication</span><span class="p">.</span><span class="na">NOT_CONNECTED</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">metrics</span><span class="p">.</span><span class="na">notConnected</span><span class="p">.</span><span class="na">increment</span><span class="p">();</span>
+<span class="w">            </span><span class="n">Thread</span><span class="p">.</span><span class="na">yield</span><span class="p">();</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="c1">// ... 其他情况</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h2 id="254-strategy-engine">25.4 Strategy Engine 骨架</h2>
+<div class="codehilite"><pre><span></span><code><span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">StrategyEngine</span><span class="w"> </span><span class="kd">implements</span><span class="w"> </span><span class="n">Agent</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="n">Subscription</span><span class="w"> </span><span class="n">subscription</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="n">MessageHeaderDecoder</span><span class="w"> </span><span class="n">header</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">MessageHeaderDecoder</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="n">MarketTickDecoder</span><span class="w"> </span><span class="n">decoder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">MarketTickDecoder</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="n">FragmentHandler</span><span class="w"> </span><span class="n">handler</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="n">Object2LongHashMap</span><span class="o">&lt;</span><span class="n">String</span><span class="o">&gt;</span><span class="w"> </span><span class="n">symbolMids</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">Object2LongHashMap</span><span class="o">&lt;&gt;</span><span class="p">(</span><span class="o">-</span><span class="mi">1L</span><span class="p">);</span>
+
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="nf">StrategyEngine</span><span class="p">(</span><span class="n">Aeron</span><span class="w"> </span><span class="n">aeron</span><span class="p">,</span><span class="w"> </span><span class="n">String</span><span class="w"> </span><span class="n">channel</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">streamId</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">this</span><span class="p">.</span><span class="na">subscription</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">aeron</span><span class="p">.</span><span class="na">addSubscription</span><span class="p">(</span><span class="n">channel</span><span class="p">,</span><span class="w"> </span><span class="n">streamId</span><span class="p">);</span>
+<span class="w">        </span><span class="k">this</span><span class="p">.</span><span class="na">handler</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">FragmentAssembler</span><span class="p">(</span><span class="k">this</span><span class="p">::</span><span class="n">onFragment</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">onFragment</span><span class="p">(</span><span class="n">DirectBuffer</span><span class="w"> </span><span class="n">buffer</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">offset</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">length</span><span class="p">,</span><span class="w"> </span><span class="n">Header</span><span class="w"> </span><span class="n">hdr</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">header</span><span class="p">.</span><span class="na">wrap</span><span class="p">(</span><span class="n">buffer</span><span class="p">,</span><span class="w"> </span><span class="n">offset</span><span class="p">);</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">header</span><span class="p">.</span><span class="na">templateId</span><span class="p">()</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="n">MarketTickDecoder</span><span class="p">.</span><span class="na">TEMPLATE_ID</span><span class="p">)</span><span class="w"> </span><span class="k">return</span><span class="p">;</span>
+
+<span class="w">        </span><span class="n">decoder</span><span class="p">.</span><span class="na">wrap</span><span class="p">(</span><span class="n">buffer</span><span class="p">,</span><span class="w"> </span><span class="n">offset</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">MessageHeaderDecoder</span><span class="p">.</span><span class="na">ENCODED_LENGTH</span><span class="p">,</span>
+<span class="w">            </span><span class="n">header</span><span class="p">.</span><span class="na">blockLength</span><span class="p">(),</span><span class="w"> </span><span class="n">header</span><span class="p">.</span><span class="na">version</span><span class="p">());</span>
+
+<span class="w">        </span><span class="kt">long</span><span class="w"> </span><span class="n">ts</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">decoder</span><span class="p">.</span><span class="na">timestamp</span><span class="p">();</span>
+<span class="w">        </span><span class="kt">long</span><span class="w"> </span><span class="n">bid</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">decoder</span><span class="p">.</span><span class="na">bidPrice</span><span class="p">();</span>
+<span class="w">        </span><span class="kt">long</span><span class="w"> </span><span class="n">ask</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">decoder</span><span class="p">.</span><span class="na">askPrice</span><span class="p">();</span>
+<span class="w">        </span><span class="n">String</span><span class="w"> </span><span class="n">exchange</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">decoder</span><span class="p">.</span><span class="na">exchange</span><span class="p">();</span>
+
+<span class="w">        </span><span class="kt">long</span><span class="w"> </span><span class="n">mid</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">bid</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">ask</span><span class="p">)</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+<span class="w">        </span><span class="n">symbolMids</span><span class="p">.</span><span class="na">put</span><span class="p">(</span><span class="n">exchange</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="s">&quot;:&quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">decoder</span><span class="p">.</span><span class="na">symbolId</span><span class="p">(),</span><span class="w"> </span><span class="n">mid</span><span class="p">);</span>
+
+<span class="w">        </span><span class="c1">// 简单信号：跨交易所价差</span>
+<span class="w">        </span><span class="n">checkArbitrage</span><span class="p">();</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">checkArbitrage</span><span class="p">()</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="cm">/* ... */</span><span class="w"> </span><span class="p">}</span>
+
+<span class="w">    </span><span class="nd">@Override</span><span class="w"> </span><span class="kd">public</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="nf">doWork</span><span class="p">()</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="n">subscription</span><span class="p">.</span><span class="na">poll</span><span class="p">(</span><span class="n">handler</span><span class="p">,</span><span class="w"> </span><span class="mi">20</span><span class="p">);</span><span class="w"> </span><span class="p">}</span>
+<span class="w">    </span><span class="nd">@Override</span><span class="w"> </span><span class="kd">public</span><span class="w"> </span><span class="n">String</span><span class="w"> </span><span class="nf">roleName</span><span class="p">()</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="s">&quot;strategy&quot;</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h2 id="255-recorderarchive">25.5 Recorder（Archive）</h2>
+<p>利用 Ch19：</p>
+<div class="codehilite"><pre><span></span><code><span class="kt">long</span><span class="w"> </span><span class="n">recordingSubId</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">archive</span><span class="p">.</span><span class="na">startRecording</span><span class="p">(</span>
+<span class="w">    </span><span class="s">&quot;aeron:ipc?alias=market&quot;</span><span class="p">,</span><span class="w"> </span><span class="mi">1001</span><span class="p">,</span><span class="w"> </span><span class="n">SourceLocation</span><span class="p">.</span><span class="na">LOCAL</span><span class="p">);</span>
+</code></pre></div>
+
+<p>自动把 <code>market</code> stream 全部落地。</p>
+<h2 id="256">25.6 组装与启动</h2>
+<div class="codehilite"><pre><span></span><code><span class="kd">public</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">main</span><span class="p">(</span><span class="n">String</span><span class="o">[]</span><span class="w"> </span><span class="n">args</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">MediaDriver</span><span class="w"> </span><span class="n">driver</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">MediaDriver</span><span class="p">.</span><span class="na">launchEmbedded</span><span class="p">();</span>
+<span class="w">    </span><span class="n">Aeron</span><span class="w"> </span><span class="n">aeron</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Aeron</span><span class="p">.</span><span class="na">connect</span><span class="p">(</span><span class="k">new</span><span class="w"> </span><span class="n">Aeron</span><span class="p">.</span><span class="na">Context</span><span class="p">()</span>
+<span class="w">        </span><span class="p">.</span><span class="na">aeronDirectoryName</span><span class="p">(</span><span class="n">driver</span><span class="p">.</span><span class="na">aeronDirectoryName</span><span class="p">()));</span>
+
+<span class="w">    </span><span class="n">Archive</span><span class="w"> </span><span class="n">archive</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Archive</span><span class="p">.</span><span class="na">launch</span><span class="p">(</span><span class="k">new</span><span class="w"> </span><span class="n">Archive</span><span class="p">.</span><span class="na">Context</span><span class="p">()</span>
+<span class="w">        </span><span class="p">.</span><span class="na">aeronDirectoryName</span><span class="p">(</span><span class="n">driver</span><span class="p">.</span><span class="na">aeronDirectoryName</span><span class="p">())</span>
+<span class="w">        </span><span class="p">.</span><span class="na">archiveDir</span><span class="p">(</span><span class="k">new</span><span class="w"> </span><span class="n">File</span><span class="p">(</span><span class="s">&quot;/tmp/marketbus-archive&quot;</span><span class="p">))</span>
+<span class="w">        </span><span class="p">.</span><span class="na">controlChannel</span><span class="p">(</span><span class="s">&quot;aeron:ipc&quot;</span><span class="p">)</span>
+<span class="w">        </span><span class="p">.</span><span class="na">replicationChannel</span><span class="p">(</span><span class="s">&quot;aeron:ipc&quot;</span><span class="p">));</span>
+<span class="w">    </span><span class="n">AeronArchive</span><span class="w"> </span><span class="n">archiveClient</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">AeronArchive</span><span class="p">.</span><span class="na">connect</span><span class="p">(</span><span class="k">new</span><span class="w"> </span><span class="n">AeronArchive</span><span class="p">.</span><span class="na">Context</span><span class="p">()</span>
+<span class="w">        </span><span class="p">.</span><span class="na">aeron</span><span class="p">(</span><span class="n">aeron</span><span class="p">)</span>
+<span class="w">        </span><span class="p">.</span><span class="na">controlRequestChannel</span><span class="p">(</span><span class="s">&quot;aeron:ipc&quot;</span><span class="p">)</span>
+<span class="w">        </span><span class="p">.</span><span class="na">controlResponseChannel</span><span class="p">(</span><span class="s">&quot;aeron:ipc&quot;</span><span class="p">));</span>
+
+<span class="w">    </span><span class="c1">// 启动业务 agents</span>
+<span class="w">    </span><span class="n">StrategyEngine</span><span class="w"> </span><span class="n">strategy</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">StrategyEngine</span><span class="p">(</span><span class="n">aeron</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;aeron:ipc?alias=market&quot;</span><span class="p">,</span><span class="w"> </span><span class="mi">1001</span><span class="p">);</span>
+<span class="w">    </span><span class="n">RiskEngine</span><span class="w"> </span><span class="n">risk</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">RiskEngine</span><span class="p">(</span><span class="n">aeron</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;aeron:ipc?alias=market&quot;</span><span class="p">,</span><span class="w"> </span><span class="mi">1001</span><span class="p">);</span>
+<span class="w">    </span><span class="n">AgentRunner</span><span class="w"> </span><span class="n">strategyRunner</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">AgentRunner</span><span class="p">(</span>
+<span class="w">        </span><span class="k">new</span><span class="w"> </span><span class="n">BackoffIdleStrategy</span><span class="p">(</span><span class="mi">100</span><span class="p">,</span><span class="w"> </span><span class="mi">10</span><span class="p">,</span><span class="w"> </span><span class="mi">1_000</span><span class="p">,</span><span class="w"> </span><span class="mi">100_000</span><span class="p">),</span>
+<span class="w">        </span><span class="n">Throwable</span><span class="p">::</span><span class="n">printStackTrace</span><span class="p">,</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span><span class="w"> </span><span class="n">strategy</span><span class="p">);</span>
+<span class="w">    </span><span class="n">AgentRunner</span><span class="w"> </span><span class="n">riskRunner</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">AgentRunner</span><span class="p">(...);</span>
+<span class="w">    </span><span class="n">AgentRunner</span><span class="p">.</span><span class="na">startOnThread</span><span class="p">(</span><span class="n">strategyRunner</span><span class="p">);</span>
+<span class="w">    </span><span class="n">AgentRunner</span><span class="p">.</span><span class="na">startOnThread</span><span class="p">(</span><span class="n">riskRunner</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 启动 recorder</span>
+<span class="w">    </span><span class="n">archiveClient</span><span class="p">.</span><span class="na">startRecording</span><span class="p">(</span><span class="s">&quot;aeron:ipc?alias=market&quot;</span><span class="p">,</span><span class="w"> </span><span class="mi">1001</span><span class="p">,</span><span class="w"> </span><span class="n">SourceLocation</span><span class="p">.</span><span class="na">LOCAL</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 启动 collector（Netty）</span>
+<span class="w">    </span><span class="n">NettyCollectorBootstrap</span><span class="p">.</span><span class="na">startAll</span><span class="p">(</span><span class="k">new</span><span class="w"> </span><span class="n">MarketCollector</span><span class="p">(</span><span class="n">aeron</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;aeron:ipc?alias=market&quot;</span><span class="p">,</span><span class="w"> </span><span class="mi">1001</span><span class="p">));</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h2 id="257-fail-over-ipc-mdc-cluster">25.7 Fail-Over 演进：从 IPC 到 MDC + Cluster</h2>
+<p>单机 IPC → 跨机 UDP MDC → Cluster 保证一致性。步骤：</p>
+<ol>
+<li><strong>Phase 1</strong>：单机 IPC（本章上面示例）</li>
+<li><strong>Phase 2</strong>：把 collector 换到独立 JVM，driver 独立部署；用 IPC。</li>
+<li><strong>Phase 3</strong>：跨机：Collector 用 MDC 广播到多个 Strategy Node。</li>
+<li><strong>Phase 4</strong>：把 Strategy 变成 Clustered Service，multi-region fail-over。</li>
+</ol>
+<h2 id="258">25.8 观测</h2>
+<p>必看 counter：
+- <code>pub-pos vs sub-pos</code>：strategy / risk 的积压；
+- <code>pub-back-pressured</code>：collector 的压力信号；
+- Archive recording position vs live position：录制是否跟得上。</p>
+<h2 id="259-demo10">25.9 从 demo10 到本章</h2>
+<p>配套代码 <code>demo10/Demo10MarketDataBus.java</code> 是本章 Phase 1 的极简版：
+- IPC + BackoffIdle + FragmentAssembler + DirectBuffer
+- 演示 Strategy + Recorder 双消费者</p>
+<p>在此基础上加：
+- SBE encoder / decoder（Ch12）
+- Netty 实际 WebSocket 客户端（Java 生态很多轮子）
+- Archive.launch + startRecording（Ch19）
+- Cluster wrapping（Ch22）</p>
+<h2 id="2510">25.10 结语</h2>
+<p>到这里，你已经能：
+- 独立部署 MediaDriver / Archive；
+- 用 SBE + tryClaim 做零拷贝发送；
+- 用 FragmentAssembler + AgentRunner 组织消费循环；
+- 应对 BackPressure、监控 counter、排查常见问题；
+- 理解 Cluster 的一致性模型并动手写 Clustered Service。</p>
+<p>下一步的路：
+- 读一遍 <code>aeron-cookbook-code</code> 的 samples；
+- 拿 <code>EmbeddedThroughput</code> / <code>Ping</code> / <code>Pong</code> 跑一次机器基线；
+- 把你现有的 Kafka / Netty 内部消息通路，选一个非关键的用 Aeron 重写，对比延迟；
+- 遇到具体问题回本书 Ch24 查排错清单。</p>
+<p>祝你在低延迟的世界里跑得又快又稳。</p>
+<nav class="chapter-nav"><a href="ch24-troubleshooting.html" class="nav-link">← 第 24 章 · 常见错误与排错手册</a><a href="index.html" class="nav-link home">📖 目录</a><span class="nav-link next">&nbsp;</span></nav>
+</article>
+<script>
+  // 高亮所有非 mermaid 代码块
+  document.querySelectorAll('pre code:not(.language-mermaid)').forEach(el => {
+    if (window.hljs) hljs.highlightElement(el);
+  });
+</script>
+</body>
+</html>

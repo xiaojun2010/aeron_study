@@ -7,6 +7,30 @@
 - 会画 Aeron 与 Kafka / Netty / RabbitMQ / ZeroMQ 的对比矩阵；
 - 明白什么场景 **不** 应该用 Aeron。
 
+## 本章速览
+
+```mermaid
+mindmap
+  root((为什么选 Aeron))
+    定位
+      低延迟传输
+      高吞吐
+      不是持久化事件日志
+    对比
+      Kafka: ms 级, 持久化
+      Netty: 底层网络框架
+      Aeron: μs 级, 传输
+    场景
+      适合::高频交易/行情/游戏
+      不适合::跨云/长期存储/低频消息
+    三层
+      Transport (本书 Part I~V)
+      Archive (Part VI)
+      Cluster (Part VII)
+```
+
+**一图记住定位**：把 Aeron 想成"机房内部的高速公路"——快、直、专用，但不适合"跨省长途货运"（那种交给 Kafka）。
+
 ## 1.1 一句话定义
 
 > **Aeron 是面向低延迟、高吞吐场景的消息传输系统。**
@@ -22,6 +46,22 @@
 ## 1.2 Aeron 与 Kafka：不是"更快的 Kafka"
 
 初学者最常犯的错就是把 Aeron 当 Kafka 用。这两者的设计目标完全不同：
+
+```mermaid
+flowchart LR
+    subgraph Kafka["Kafka 消息路径"]
+        KP[Producer] -->|TCP + batch| KB[(Broker<br/>持久化)]
+        KB -->|Disk log<br/>segments| KC[Consumer]
+    end
+    subgraph Aeron["Aeron 消息路径"]
+        AP[Publisher] -->|SHM/UDP<br/>无 batch| AM[MediaDriver]
+        AM -->|zero-copy<br/>term buffer| AC[Subscription]
+    end
+    style Kafka fill:#fde8e8
+    style Aeron fill:#e8f4fd
+```
+
+**核心区别**：Kafka 把消息"存下来"，Aeron 把消息"送过去"。
 
 ```
 Kafka                                 Aeron Transport
@@ -81,18 +121,39 @@ Binance WebSocket  ──> Netty (WS 解析) ──> Aeron (内部低延迟总�
 
 官方仓库明确把开源栈分成 3 层：
 
+```mermaid
+flowchart TB
+    C["Aeron Cluster<br/>Raft 复制状态机<br/>业务对象自动多副本"]
+    A["Aeron Archive<br/>录制 / 回放<br/>把 stream 落地"]
+    T["Aeron Transport<br/>IPC / UDP 消息传输<br/>Pub-Sub 语义"]
+    C --> A
+    A --> T
+    style C fill:#ffd6a5
+    style A fill:#fdffb6
+    style T fill:#caffbf
 ```
-┌───────────────────────────────────────────────┐
-│              Aeron Cluster                    │  Raft 复制状态机
-├───────────────────────────────────────────────┤
-│              Aeron Archive                    │  录制 / 回放
-├───────────────────────────────────────────────┤
-│              Aeron Transport                  │  IPC / UDP 消息传输
-└───────────────────────────────────────────────┘
-```
+
+**类比**：
+- Transport = 高速公路
+- Archive = 高速公路上的收费站 + 摄像头录像
+- Cluster = 多条平行高速公路 + 自动切换车道
 
 **学习顺序必须严格自底向上**：先玩透 Transport，再看 Archive，最后再碰 Cluster。
 本书 Part I ~ V 全部是 Transport；Part VI 才进入 Archive；Part VII 才是 Cluster。
+
+### 延迟量级直观对比
+
+```
+Kafka producer→consumer     ████████████████████████████ 5 ms
+RabbitMQ                    █████████████████ 2 ms
+gRPC LAN                    ██████ 500 μs
+Aeron UDP LAN (10GbE)       █ 10 μs
+Aeron IPC 8 字节            ▏ 500 ns
+                            └─────────────────────────────
+                            越短越快
+```
+
+从毫秒到纳秒的一整个数量级差距，就是选 Aeron 的第一理由。
 
 ## 1.6 版本选择
 

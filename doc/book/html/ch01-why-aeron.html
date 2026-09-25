@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 01 章 · 为什么选择 Aeron？消息模型对比</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-light.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/index.min.js"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose" });
+</script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+                 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2em 1em 4em;
+    background: #fafafa;
+    color: #24292f;
+  }
+  .markdown-body {
+    background: #ffffff;
+    padding: 2.5em 3em;
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+  }
+  .markdown-body pre {
+    background: #f6f8fa !important;
+  }
+  .markdown-body pre.mermaid {
+    background: transparent !important;
+    text-align: center;
+    padding: 1em;
+  }
+  nav.chapter-nav {
+    display: flex;
+    justify-content: space-between;
+    padding: 1em;
+    margin-bottom: 1.5em;
+    background: #eef2f7;
+    border-radius: 8px;
+    font-size: 0.95em;
+  }
+  nav.chapter-nav a {
+    color: #0969da;
+    text-decoration: none;
+  }
+  nav.chapter-nav a:hover { text-decoration: underline; }
+  nav.chapter-nav .nav-link { min-width: 30%; }
+  nav.chapter-nav .nav-link.next { text-align: right; }
+  nav.chapter-nav .nav-link.home { text-align: center; }
+</style>
+</head>
+<body>
+<article class="markdown-body">
+<nav class="chapter-nav"><a href="00.html" class="nav-link">← 00</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch02-core-concepts.html" class="nav-link next">第 02 章 · 六个核心概念快览 →</a></nav>
+<h1 id="01-aeron">第 01 章 · 为什么选择 Aeron？消息模型对比</h1>
+<h2 id="_1">学习目标</h2>
+<ul>
+<li>用一句话说清楚 Aeron 定位；</li>
+<li>分清"消息队列"、"事件日志"、"低延迟传输"三个概念；</li>
+<li>会画 Aeron 与 Kafka / Netty / RabbitMQ / ZeroMQ 的对比矩阵；</li>
+<li>明白什么场景 <strong>不</strong> 应该用 Aeron。</li>
+</ul>
+<h2 id="_2">本章速览</h2>
+<pre class="mermaid">
+mindmap
+  root((为什么选 Aeron))
+    定位
+      低延迟传输
+      高吞吐
+      不是持久化事件日志
+    对比
+      Kafka: ms 级, 持久化
+      Netty: 底层网络框架
+      Aeron: μs 级, 传输
+    场景
+      适合::高频交易/行情/游戏
+      不适合::跨云/长期存储/低频消息
+    三层
+      Transport (本书 Part I~V)
+      Archive (Part VI)
+      Cluster (Part VII)
+</pre>
+
+<p><strong>一图记住定位</strong>：把 Aeron 想成"机房内部的高速公路"——快、直、专用，但不适合"跨省长途货运"（那种交给 Kafka）。</p>
+<h2 id="11">1.1 一句话定义</h2>
+<blockquote>
+<p><strong>Aeron 是面向低延迟、高吞吐场景的消息传输系统。</strong></p>
+</blockquote>
+<p>它支持三种传输介质：</p>
+<table>
+<thead>
+<tr>
+<th>介质</th>
+<th>Channel URI 前缀</th>
+<th>延迟量级</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>共享内存（IPC）</td>
+<td><code>aeron:ipc</code></td>
+<td>亚微秒</td>
+<td>同机器进程/线程间</td>
+</tr>
+<tr>
+<td>UDP 单播</td>
+<td><code>aeron:udp?endpoint=host:port</code></td>
+<td>微秒级</td>
+<td>跨机器点对点</td>
+</tr>
+<tr>
+<td>UDP 多播</td>
+<td><code>aeron:udp?endpoint=224.x.x.x:port</code></td>
+<td>微秒级</td>
+<td>跨机器 1→N</td>
+</tr>
+</tbody>
+</table>
+<h2 id="12-aeron-kafka-kafka">1.2 Aeron 与 Kafka：不是"更快的 Kafka"</h2>
+<p>初学者最常犯的错就是把 Aeron 当 Kafka 用。这两者的设计目标完全不同：</p>
+<pre class="mermaid">
+flowchart LR
+    subgraph Kafka["Kafka 消息路径"]
+        KP[Producer] -->|TCP + batch| KB[(Broker<br/>持久化)]
+        KB -->|Disk log<br/>segments| KC[Consumer]
+    end
+    subgraph Aeron["Aeron 消息路径"]
+        AP[Publisher] -->|SHM/UDP<br/>无 batch| AM[MediaDriver]
+        AM -->|zero-copy<br/>term buffer| AC[Subscription]
+    end
+    style Kafka fill:#fde8e8
+    style Aeron fill:#e8f4fd
+</pre>
+
+<p><strong>核心区别</strong>：Kafka 把消息"存下来"，Aeron 把消息"送过去"。</p>
+<div class="codehilite"><pre><span></span><code>Kafka                                 Aeron Transport
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Producer                              Publisher
+   ↓ TCP (含 batch/compress)             ↓ SHM / UDP (无 batch)
+Broker (持久化 event log)              Media Driver (只做传输)
+   ↓ Disk (segments)                     ↓ 共享内存 term buffer
+Consumer (consumer group)              Subscription (独立 poll)
+
+存储：默认持久 (7 天+)              存储：无 (Archive 单独组件)
+偏移：Broker 记 offset             偏移：Client 自己维护 position
+吞吐：几十万 msg/s                 吞吐：单流 6M+ msg/s
+延迟：ms 量级                      延迟：&lt; 20 μs (IPC 亚微秒)
+可靠：at-least-once/exactly-once   可靠：session-based，尽力可靠
+</code></pre></div>
+
+<h3 id="_3">对照矩阵</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>Kafka</th>
+<th>Aeron Transport</th>
+<th>Aeron Archive</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>定位</td>
+<td>事件日志 / 消息中间件</td>
+<td>低延迟传输</td>
+<td>传输 + 持久化/回放</td>
+</tr>
+<tr>
+<td>部署</td>
+<td>Broker 集群</td>
+<td>MediaDriver 进程</td>
+<td>Archive 进程</td>
+</tr>
+<tr>
+<td>存储</td>
+<td>强制、可长期</td>
+<td>无</td>
+<td>可选、可 Replay</td>
+</tr>
+<tr>
+<td>消费者关系</td>
+<td>Consumer Group 竞争</td>
+<td>Subscription 广播</td>
+<td></td>
+</tr>
+<tr>
+<td>分区</td>
+<td>Partition 一等公民</td>
+<td>无（用 stream/session 手工分）</td>
+<td></td>
+</tr>
+<tr>
+<td>序列化</td>
+<td>由业务定</td>
+<td>由业务定（推荐 SBE）</td>
+<td></td>
+</tr>
+<tr>
+<td>典型延迟</td>
+<td>ms</td>
+<td>μs</td>
+<td></td>
+</tr>
+<tr>
+<td>典型客户</td>
+<td>数据管道、事件驱动系统</td>
+<td>高频交易、行情、游戏、L1 撮合</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h2 id="13-aeron-netty">1.3 Aeron 与 Netty</h2>
+<p>Netty 是"应用层网络框架"，帮你处理 TCP/UDP 的粘包、编解码、Handler 链等。
+Aeron 是"消息传输系统"，比 Netty 更上层：</p>
+<ul>
+<li>Netty 给你 pipe，你自己造"消息协议"</li>
+<li>Aeron 给你 pub/sub + 可靠 UDP + 流控 + 广播 + 回放，"协议就是 Aeron 协议"</li>
+</ul>
+<p>一个常见组合：</p>
+<div class="codehilite"><pre><span></span><code>Binance WebSocket  ──&gt; Netty (WS 解析) ──&gt; Aeron (内部低延迟总线)
+                              │
+                              └─ Netty 负责跨互联网的复杂 IO
+                                 Aeron 负责机房内的高性能消息分发
+</code></pre></div>
+
+<h2 id="14-aeron">1.4 什么时候 <strong>不</strong> 该用 Aeron</h2>
+<ul>
+<li>需要跨云、跨 NAT、复杂路由：用 gRPC / MQ</li>
+<li>需要长期持久化 + 复杂查询：用 Kafka + Kafka Streams / Flink</li>
+<li>消息量小（&lt;10k/s）、延迟不敏感：多引入一个 MediaDriver 太重</li>
+<li>团队完全没有 DirectBuffer / 内存管理经验，且没时间学：先补 JVM 内存模型</li>
+<li>你的核心问题是"函数调用慢"不是"消息慢"：先做 profile</li>
+</ul>
+<h2 id="15-aeron-transport-archive-cluster">1.5 Aeron 的三层：Transport / Archive / Cluster</h2>
+<p>官方仓库明确把开源栈分成 3 层：</p>
+<pre class="mermaid">
+flowchart TB
+    C["Aeron Cluster<br/>Raft 复制状态机<br/>业务对象自动多副本"]
+    A["Aeron Archive<br/>录制 / 回放<br/>把 stream 落地"]
+    T["Aeron Transport<br/>IPC / UDP 消息传输<br/>Pub-Sub 语义"]
+    C --> A
+    A --> T
+    style C fill:#ffd6a5
+    style A fill:#fdffb6
+    style T fill:#caffbf
+</pre>
+
+<p><strong>类比</strong>：
+- Transport = 高速公路
+- Archive = 高速公路上的收费站 + 摄像头录像
+- Cluster = 多条平行高速公路 + 自动切换车道</p>
+<p><strong>学习顺序必须严格自底向上</strong>：先玩透 Transport，再看 Archive，最后再碰 Cluster。
+本书 Part I ~ V 全部是 Transport；Part VI 才进入 Archive；Part VII 才是 Cluster。</p>
+<h3 id="_4">延迟量级直观对比</h3>
+<div class="codehilite"><pre><span></span><code>Kafka producer→consumer     ████████████████████████████ 5 ms
+RabbitMQ                    █████████████████ 2 ms
+gRPC LAN                    ██████ 500 μs
+Aeron UDP LAN (10GbE)       █ 10 μs
+Aeron IPC 8 字节            ▏ 500 ns
+                            └─────────────────────────────
+                            越短越快
+</code></pre></div>
+
+<p>从毫秒到纳秒的一整个数量级差距，就是选 Aeron 的第一理由。</p>
+<h2 id="16">1.6 版本选择</h2>
+<p>本书用 <strong>Aeron 1.44.1</strong>：
+- 支持 Java 17 / 21
+- API 和最新的 1.46.x 基本一致（Publication/Subscription 无破坏性改动）
+- 目前生态里绝大部分教程和 cookbook 都以 1.4x 为基准</p>
+<p>其他常见版本：
+- <code>1.40.0</code> ：一些老 cookbook 代码基于这个版本
+- <code>1.46.7</code> / <code>1.47.x</code> ：最新稳定，Cluster 部分 API 有微调，读官方 Wiki 即可</p>
+<h2 id="17">1.7 下一步</h2>
+<p>如果你还没读过 <code>../01.aeron 零基础入门.MD</code>，先回去把它看完，那份文档解释了"为什么先学 IPC"、"为什么是 offer/poll 而不是 callback"这些直觉问题；然后进入本书第 02 章，我们从"六个核心概念"开始正式构建心智模型。</p>
+<nav class="chapter-nav"><a href="00.html" class="nav-link">← 00</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch02-core-concepts.html" class="nav-link next">第 02 章 · 六个核心概念快览 →</a></nav>
+</article>
+<script>
+  // 高亮所有非 mermaid 代码块
+  document.querySelectorAll('pre code:not(.language-mermaid)').forEach(el => {
+    if (window.hljs) hljs.highlightElement(el);
+  });
+</script>
+</body>
+</html>

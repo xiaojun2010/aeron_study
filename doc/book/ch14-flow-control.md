@@ -7,6 +7,27 @@
 - 会为不同订阅拓扑选择合适的 flow control 策略；
 - 知道丢包时的重传机制以及 NAK。
 
+## 本章速览：三层控制职责
+
+```mermaid
+flowchart TB
+    APP[业务层<br/>决定 BackPressure 时怎么办<br/>等/丢/合并/降采样]
+    FC[Aeron 流控<br/>根据 SM 算 publisherLimit<br/>fc=min/max/tagged]
+    CC[拥塞控制<br/>StaticWindow / Cubic<br/>探测网络能吃多少]
+    LR[丢包重传<br/>NAK + term buffer 回溯<br/>subscriber 主动要]
+
+    APP --> FC
+    FC --> CC
+    CC --> LR
+
+    style APP fill:#ffd6a5
+    style FC fill:#fdffb6
+    style CC fill:#caffbf
+    style LR fill:#a0c4ff
+```
+
+**记忆**：三层像高速公路的三种规则——你自己控制车速（业务）+ 交通信号（流控）+ 匝道拥堵调度（拥塞）+ 追尾后拖车重新走（丢包重传）。
+
 ## 14.1 三层控制
 
 ```
@@ -82,6 +103,29 @@ Aeron 用 **NAK (Negative ACK)** 机制而不是 TCP 的 ACK：
 - 覆盖了 → subscriber 记 Loss，见 `loss-report.dat`。
 
 因此：**term buffer 越大，能容忍的丢包时间窗口越长**。
+
+**NAK 时序示例**：
+
+```mermaid
+sequenceDiagram
+    participant P as Publisher
+    participant N as 网络
+    participant S as Subscriber
+
+    P->>N: pos=8
+    P->>N: pos=9
+    Note over N: pos=9 丢了
+    P->>N: pos=10
+    N->>S: pos=8
+    N->>S: pos=10
+    Note over S: 检测到 gap: 缺 pos=9
+    S->>P: NAK(9)
+    P->>N: 重传 pos=9
+    N->>S: pos=9
+    Note over S: 补齐, 顺序交付业务
+```
+
+**关键点**：只有 Publisher 的 term buffer 还没覆盖 pos=9 时，重传才成功；否则记入 loss-report。
 
 ## 14.6 Loss Report
 

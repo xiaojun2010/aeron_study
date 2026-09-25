@@ -7,7 +7,12 @@
 <Configuration status="WARN">
     <Appenders>
         <Console name="Console" target="SYSTEM_OUT">
-            <PatternLayout pattern="%d{HH:mm:ss.SSS} [%t] %-5level %logger{1} - %msg%n"/>
+            <!--
+                %F / %L 需要 log4j 通过栈帧解析源码位置，有一定性能开销，
+                学习/调试场景无所谓；线上高吞吐场景建议去掉。
+                IntelliJ Console 识别 (FileName.java:line) 这个形态自动变成可点击链接。
+            -->
+            <PatternLayout pattern="%d{yyyy-MM-dd HH:mm:ss.SSS} [%t] %-5level %logger{1} (%F:%L) - %msg%n"/>
         </Console>
     </Appenders>
 
@@ -18,6 +23,7 @@
 
         <!-- 应用 demo 日志 -->
         <Logger name="org.example" level="INFO"/>
+        <Logger name="self" level="INFO"/>
 
         <Root level="INFO">
             <AppenderRef ref="Console"/>

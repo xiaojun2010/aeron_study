@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 13 章 · Image / Session / Term Buffer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-light.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/index.min.js"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose" });
+</script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+                 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2em 1em 4em;
+    background: #fafafa;
+    color: #24292f;
+  }
+  .markdown-body {
+    background: #ffffff;
+    padding: 2.5em 3em;
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+  }
+  .markdown-body pre {
+    background: #f6f8fa !important;
+  }
+  .markdown-body pre.mermaid {
+    background: transparent !important;
+    text-align: center;
+    padding: 1em;
+  }
+  nav.chapter-nav {
+    display: flex;
+    justify-content: space-between;
+    padding: 1em;
+    margin-bottom: 1.5em;
+    background: #eef2f7;
+    border-radius: 8px;
+    font-size: 0.95em;
+  }
+  nav.chapter-nav a {
+    color: #0969da;
+    text-decoration: none;
+  }
+  nav.chapter-nav a:hover { text-decoration: underline; }
+  nav.chapter-nav .nav-link { min-width: 30%; }
+  nav.chapter-nav .nav-link.next { text-align: right; }
+  nav.chapter-nav .nav-link.home { text-align: center; }
+</style>
+</head>
+<body>
+<article class="markdown-body">
+<nav class="chapter-nav"><a href="ch12-sbe.html" class="nav-link">← 第 12 章 · Simple Binary Encoding（SBE）</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch14-flow-control.html" class="nav-link next">第 14 章 · 流控、拥塞控制与 Loss Recovery →</a></nav>
+<h1 id="13-image-session-term-buffer">第 13 章 · Image / Session / Term Buffer</h1>
+<h2 id="_1">学习目标</h2>
+<ul>
+<li>把 Session、Image、Term Buffer、Position 四个词的关系全部串起来；</li>
+<li>明白 term buffer 的三段循环结构；</li>
+<li>学会用 Image API 精确控制"从哪里开始 poll"；</li>
+<li>知道 stream position 的物理编码方式。</li>
+</ul>
+<h2 id="_2">本章速览：四个词的层级关系</h2>
+<pre class="mermaid">
+flowchart TB
+    STREAM["Stream<br/>(channel + streamId)<br/>逻辑数据流"]
+    STREAM --> SESS_A["Session A<br/>Publisher A 的会话<br/>sessionId=0x1a"]
+    STREAM --> SESS_B["Session B<br/>Publisher B 的会话<br/>sessionId=0x2b"]
+    SESS_A --> LOG_A["Publication.log 文件<br/>3 × term buffer"]
+    SESS_B --> LOG_B["Publication.log 文件<br/>3 × term buffer"]
+    LOG_A --> IMG_A["Image A<br/>(订阅方视角)"]
+    LOG_B --> IMG_B["Image B<br/>(订阅方视角)"]
+    IMG_A --> SUB[Subscription]
+    IMG_B --> SUB
+    POS["stream position<br/>= termId × termLen + termOffset"]
+    IMG_A -.持有.-> POS
+    IMG_B -.持有.-> POS
+    style STREAM fill:#fef3c7
+    style SUB fill:#caffbf
+    style POS fill:#a0c4ff
+</pre>
+
+<h2 id="131">13.1 一张全景图</h2>
+<div class="codehilite"><pre><span></span><code>Publisher (sessionId=S) ─── offer/tryClaim ───▶
+                                                │
+                                                ▼
+┌────────────────────────────────────────────────────────────┐
+│              Publication.log (共享内存文件)                 │
+│                                                            │
+│  term[0]  │  term[1]  │  term[2]                           │
+│ ─────────  ─────────  ─────────                            │
+│  循环使用（rotating log），Publisher / Subscriber 各自 term │
+└────────────────────────────────────────────────────────────┘
+                                                ▲
+                                                │
+Subscription (客户端) ──── poll ────▶ Image(sessionId=S)
+                                       持有对同一文件的只读映射
+</code></pre></div>
+
+<p>关键点：
+- <strong>每个 Publisher 会话</strong> → 一个 Publication.log 文件（三段 term）
+- <strong>每个订阅方</strong> → 通过 <code>Image</code> 拿到这个文件的只读 mmap
+- 一个 Subscription 可以有 <strong>多个 Image</strong>（多个 Publisher 打给它）</p>
+<h2 id="132-term-buffer">13.2 Term Buffer 三段循环</h2>
+<div class="codehilite"><pre><span></span><code>term-length = T bytes（比如 16 MB）
+一个 Publication.log 文件包含 3 × T 的空间
+
+┌──────────┬──────────┬──────────┐
+│ term[0]  │ term[1]  │ term[2]  │
+└──────────┴──────────┴──────────┘
+    0..T-1     T..2T-1   2T..3T-1
+</code></pre></div>
+
+<p>写入 term[0] 满了 → 切到 term[1] → 满了 → 切到 term[2] → 满了 → 回到 term[0]</p>
+<p><strong>回到 term[0] 前，必须确保所有订阅者已经消费过 term[0]</strong>，否则 Publisher 被 BackPressure 挂住。</p>
+<h2 id="133-stream-position">13.3 Stream Position 的编码</h2>
+<p><strong>位打包示意</strong>（64-bit long）：</p>
+<div class="codehilite"><pre><span></span><code> 63           32 31           0
+ ┌─────────────┬─────────────┐
+ │   termId    │  termOffset  │
+ │  (32 bit)   │   (32 bit)   │
+ └─────────────┴─────────────┘
+        ▲              ▲
+     term 编号     term 内偏移
+    (0,1,2 循环)   (0 ~ termLen-1)
+
+position = (termId &lt;&lt; 32) | termOffset   (概念上)
+       = termId * termLen + termOffset (语义上)
+</code></pre></div>
+
+<p>一个 64-bit 的 position 里：</p>
+<div class="codehilite"><pre><span></span><code>+──────────────────────+──────────────+
+│ termId (32-bit)      │ termOffset  │
++──────────────────────+──────────────+
+   位于哪个 term (自增)     term 内偏移
+</code></pre></div>
+
+<p>从 position 反解：</p>
+<div class="codehilite"><pre><span></span><code><span class="kt">int</span><span class="w"> </span><span class="n">termLength</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">...;</span>
+<span class="kt">int</span><span class="w"> </span><span class="n">positionBits</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Integer</span><span class="p">.</span><span class="na">numberOfTrailingZeros</span><span class="p">(</span><span class="n">termLength</span><span class="p">);</span>
+<span class="kt">int</span><span class="w"> </span><span class="n">termId</span><span class="w">       </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="p">)</span><span class="w"> </span><span class="p">(</span><span class="n">position</span><span class="w"> </span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="n">positionBits</span><span class="p">);</span>
+<span class="kt">int</span><span class="w"> </span><span class="n">termOffset</span><span class="w">   </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="p">)</span><span class="w"> </span><span class="p">(</span><span class="n">position</span><span class="w"> </span><span class="o">&amp;</span><span class="w"> </span><span class="p">(</span><span class="n">termLength</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">));</span>
+</code></pre></div>
+
+<p>Aeron 提供辅助：<code>LogBufferDescriptor.computePosition(termId, termOffset, positionBits, initialTermId)</code>。</p>
+<h2 id="134-image-api">13.4 Image 提供的 API</h2>
+<div class="codehilite"><pre><span></span><code><span class="n">Image</span><span class="w"> </span><span class="n">image</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">subscription</span><span class="p">.</span><span class="na">imageAtIndex</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span><span class="w">  </span><span class="c1">// 或 imageBySessionId(...)</span>
+
+<span class="kt">long</span><span class="w"> </span><span class="n">pos</span><span class="w">   </span><span class="o">=</span><span class="w"> </span><span class="n">image</span><span class="p">.</span><span class="na">position</span><span class="p">();</span>
+<span class="kt">int</span><span class="w">  </span><span class="n">termId</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">image</span><span class="p">.</span><span class="na">termId</span><span class="p">();</span>
+<span class="kt">int</span><span class="w">  </span><span class="n">termOffset</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">image</span><span class="p">.</span><span class="na">termOffset</span><span class="p">();</span>
+<span class="kt">int</span><span class="w">  </span><span class="n">sessionId</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">image</span><span class="p">.</span><span class="na">sessionId</span><span class="p">();</span>
+<span class="n">String</span><span class="w"> </span><span class="n">sourceIdentity</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">image</span><span class="p">.</span><span class="na">sourceIdentity</span><span class="p">();</span><span class="w"> </span><span class="c1">// &quot;ip:port&quot; (UDP) or &quot;unknown&quot; (IPC)</span>
+
+<span class="kt">int</span><span class="w"> </span><span class="nf">poll</span><span class="p">(</span><span class="n">FragmentHandler</span><span class="w"> </span><span class="n">h</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">limit</span><span class="p">);</span>
+<span class="kt">int</span><span class="w"> </span><span class="nf">controlledPoll</span><span class="p">(</span><span class="n">ControlledFragmentHandler</span><span class="w"> </span><span class="n">h</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">limit</span><span class="p">);</span>
+<span class="kt">int</span><span class="w"> </span><span class="nf">boundedPoll</span><span class="p">(</span><span class="n">FragmentHandler</span><span class="w"> </span><span class="n">h</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">limitPos</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">fragmentLimit</span><span class="p">);</span>
+<span class="kt">int</span><span class="w"> </span><span class="nf">blockPoll</span><span class="p">(</span><span class="n">BlockHandler</span><span class="w"> </span><span class="n">h</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">blockLengthLimit</span><span class="p">);</span>
+</code></pre></div>
+
+<p><strong>boundedPoll</strong> 特别有用：只允许 poll 到某个 position 为止，做"回放到检查点"：</p>
+<div class="codehilite"><pre><span></span><code><span class="kt">long</span><span class="w"> </span><span class="n">checkpointPos</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">image</span><span class="p">.</span><span class="na">position</span><span class="p">()</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1_000_000</span><span class="p">;</span><span class="w">   </span><span class="c1">// 允许再读 1 MB</span>
+<span class="n">image</span><span class="p">.</span><span class="na">boundedPoll</span><span class="p">(</span><span class="n">handler</span><span class="p">,</span><span class="w"> </span><span class="n">checkpointPos</span><span class="p">,</span><span class="w"> </span><span class="mi">10</span><span class="p">);</span>
+</code></pre></div>
+
+<h2 id="135-session-id">13.5 Session ID 的分配</h2>
+<ul>
+<li><strong>随机模式</strong>（默认）：Aeron client 生成 32-bit 随机；</li>
+<li><strong>手动模式</strong>：URI 里加 <code>session-id=12345</code>；</li>
+<li><strong>范围保留</strong>：<code>Aeron.Context.publicationReservedSessionIdLow / High</code>。</li>
+</ul>
+<p>在 Cluster 里，consensus module 会保留一段 sessionId 给自己内部通信。</p>
+<h2 id="136-publicationlog">13.6 Publication.log 文件布局</h2>
+<p>在 <code>${aeronDir}/publications/${sessionId}-${streamId}-...</code> 下：</p>
+<div class="codehilite"><pre><span></span><code>+──────────── 64 KB header ────────────+
+│ log metadata: term-length, mtu, ...   │
++──────────────────────────────────────+
+│ term[0]                               │
++──────────────────────────────────────+
+│ term[1]                               │
++──────────────────────────────────────+
+│ term[2]                               │
++──────────────────────────────────────+
+</code></pre></div>
+
+<p>metadata 里存 <code>activeTermId</code> / <code>termOffset</code> / <code>publisherPosition</code> 等。</p>
+<p>用 <code>LogBufferDescriptor</code> API 可以读这些字段做深度诊断。</p>
+<h2 id="137-image">13.7 Image 的可用性事件</h2>
+<p>Subscription 上可以注册两个 callback：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">aeron</span><span class="p">.</span><span class="na">addSubscription</span><span class="p">(</span>
+<span class="w">    </span><span class="n">channel</span><span class="p">,</span><span class="w"> </span><span class="n">streamId</span><span class="p">,</span>
+<span class="w">    </span><span class="n">image</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">log</span><span class="p">.</span><span class="na">info</span><span class="p">(</span><span class="s">&quot;上线 sessionId={} src={}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">image</span><span class="p">.</span><span class="na">sessionId</span><span class="p">(),</span><span class="w"> </span><span class="n">image</span><span class="p">.</span><span class="na">sourceIdentity</span><span class="p">()),</span>
+<span class="w">    </span><span class="n">image</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">log</span><span class="p">.</span><span class="na">info</span><span class="p">(</span><span class="s">&quot;下线 sessionId={} pos={}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">image</span><span class="p">.</span><span class="na">sessionId</span><span class="p">(),</span><span class="w"> </span><span class="n">image</span><span class="p">.</span><span class="na">position</span><span class="p">()));</span>
+</code></pre></div>
+
+<p>生产环境这些事件通常上报到监控（每个 sessionId 对应哪个上游）。</p>
+<h2 id="138-sessionid">13.8 一段"按 sessionId 分发"的示例</h2>
+<p>有些系统希望"某个 sessionId 的消息进入队列 A，其他进入队列 B"：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">Long2ObjectHashMap</span><span class="o">&lt;</span><span class="n">MyQueue</span><span class="o">&gt;</span><span class="w"> </span><span class="n">routing</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">Long2ObjectHashMap</span><span class="o">&lt;&gt;</span><span class="p">();</span>
+
+<span class="n">subscription</span><span class="p">.</span><span class="na">forEachImage</span><span class="p">(</span><span class="n">image</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">MyQueue</span><span class="w"> </span><span class="n">q</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">routing</span><span class="p">.</span><span class="na">get</span><span class="p">(</span><span class="n">image</span><span class="p">.</span><span class="na">sessionId</span><span class="p">());</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">q</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">null</span><span class="p">)</span><span class="w"> </span><span class="n">image</span><span class="p">.</span><span class="na">poll</span><span class="p">(</span><span class="n">q</span><span class="p">::</span><span class="n">enqueue</span><span class="p">,</span><span class="w"> </span><span class="mi">20</span><span class="p">);</span>
+<span class="p">});</span>
+</code></pre></div>
+
+<p><code>forEachImage</code> 让你对每个 Image 单独 poll，非常灵活。</p>
+<h2 id="139">13.9 常见陷阱</h2>
+<ol>
+<li><strong>假设 Subscription 只有一个 Image</strong>：真实系统里多 Publisher 是常态，用 <code>forEachImage</code> 或按 sessionId 处理。</li>
+<li><strong>持有 Image 引用</strong>：Image 可能被 driver 回收（订阅方断开），需要检查 <code>image.isClosed()</code>。</li>
+<li><strong>手动指定 sessionId 冲突</strong>：Cluster 场景要小心，别撞到 consensus 的保留段。</li>
+<li><strong>term-length 太小</strong>：Publisher 一秒轮 term 好几次，出现严重 BackPressure。</li>
+</ol>
+<h2 id="1310">13.10 小结</h2>
+<ul>
+<li>Aeron 传输的基础单位是 term buffer；</li>
+<li>Session/Image/Term 三个词描述同一条流的不同层面；</li>
+<li>Image 提供丰富 API 满足从 poll 到 replay 的所有场景。</li>
+</ul>
+<nav class="chapter-nav"><a href="ch12-sbe.html" class="nav-link">← 第 12 章 · Simple Binary Encoding（SBE）</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch14-flow-control.html" class="nav-link next">第 14 章 · 流控、拥塞控制与 Loss Recovery →</a></nav>
+</article>
+<script>
+  // 高亮所有非 mermaid 代码块
+  document.querySelectorAll('pre code:not(.language-mermaid)').forEach(el => {
+    if (window.hljs) hljs.highlightElement(el);
+  });
+</script>
+</body>
+</html>

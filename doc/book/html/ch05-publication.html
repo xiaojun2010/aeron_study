@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 05 章 · Publication 全解</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-light.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/index.min.js"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose" });
+</script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+                 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2em 1em 4em;
+    background: #fafafa;
+    color: #24292f;
+  }
+  .markdown-body {
+    background: #ffffff;
+    padding: 2.5em 3em;
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+  }
+  .markdown-body pre {
+    background: #f6f8fa !important;
+  }
+  .markdown-body pre.mermaid {
+    background: transparent !important;
+    text-align: center;
+    padding: 1em;
+  }
+  nav.chapter-nav {
+    display: flex;
+    justify-content: space-between;
+    padding: 1em;
+    margin-bottom: 1.5em;
+    background: #eef2f7;
+    border-radius: 8px;
+    font-size: 0.95em;
+  }
+  nav.chapter-nav a {
+    color: #0969da;
+    text-decoration: none;
+  }
+  nav.chapter-nav a:hover { text-decoration: underline; }
+  nav.chapter-nav .nav-link { min-width: 30%; }
+  nav.chapter-nav .nav-link.next { text-align: right; }
+  nav.chapter-nav .nav-link.home { text-align: center; }
+</style>
+</head>
+<body>
+<article class="markdown-body">
+<nav class="chapter-nav"><a href="ch04-media-driver.html" class="nav-link">← 第 04 章 · MediaDriver：从嵌入式到独立部署</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch06-subscription.html" class="nav-link next">第 06 章 · Subscription 与消费模型 →</a></nav>
+<h1 id="05-publication">第 05 章 · Publication 全解</h1>
+<h2 id="_1">学习目标</h2>
+<ul>
+<li>会用 <code>Publication</code> 与 <code>ExclusivePublication</code>，能说清区别；</li>
+<li>明白 <code>offer</code> / <code>tryClaim</code> / <code>offer with vectors</code> 三种发送 API；</li>
+<li>掌握 Publication 的生命周期与常见状态；</li>
+<li>了解 stream position、term id 等元信息。</li>
+</ul>
+<h2 id="_2">本章速览</h2>
+<pre class="mermaid">
+mindmap
+  root((Publication))
+    两种类型
+      Concurrent::多线程共用
+      Exclusive::单线程独占
+    三种发送
+      offer::最常用, 有拷贝
+      tryClaim::零拷贝, 需 commit
+      向量 offer::多段合并
+    生命周期
+      NotConnected → Connected → Closed
+    元信息
+      position
+      termId
+      sessionId
+</pre>
+
+<p><strong>一句话</strong>：<code>ExclusivePublication + tryClaim</code> 是零拷贝黄金组合；<code>ConcurrentPublication + offer</code> 是通用默认。</p>
+<h2 id="51-publication">5.1 两种 Publication</h2>
+<table>
+<thead>
+<tr>
+<th>API</th>
+<th>类型</th>
+<th>线程安全</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>aeron.addPublication(channel, streamId)</code></td>
+<td><code>ConcurrentPublication</code></td>
+<td>✔ 多线程可同时 offer</td>
+<td>常规业务</td>
+</tr>
+<tr>
+<td><code>aeron.addExclusivePublication(channel, streamId)</code></td>
+<td><code>ExclusivePublication</code></td>
+<td>✘ 只允许单线程调用</td>
+<td>极致低延迟、SPSC 场景</td>
+</tr>
+</tbody>
+</table>
+<p><code>ExclusivePublication</code> 的优势：
+- 不需要 CAS，写入路径少一次原子操作；
+- 支持 <code>tryClaim</code>（零拷贝写入）；
+- 支持 <code>offer</code> 的 batch。</p>
+<p>示例：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">ExclusivePublication</span><span class="w"> </span><span class="n">pub</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">aeron</span><span class="p">.</span><span class="na">addExclusivePublication</span><span class="p">(</span><span class="s">&quot;aeron:ipc&quot;</span><span class="p">,</span><span class="w"> </span><span class="mi">1001</span><span class="p">);</span>
+<span class="c1">// pub 只允许一个线程调 offer；如果多线程都要发，就要用 addPublication</span>
+</code></pre></div>
+
+<h2 id="52-api">5.2 三种发送 API</h2>
+<h3 id="521-offerbuffer-offset-length">5.2.1 offer(buffer, offset, length)</h3>
+<p>最常见，返回值语义在 Ch08 详解：</p>
+<div class="codehilite"><pre><span></span><code><span class="kt">long</span><span class="w"> </span><span class="n">result</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">pub</span><span class="p">.</span><span class="na">offer</span><span class="p">(</span><span class="n">buffer</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">length</span><span class="p">);</span>
+<span class="c1">// result &gt;= 0 : 发送成功，返回新的 stream position</span>
+<span class="c1">// result &lt; 0  : NOT_CONNECTED / BACK_PRESSURED / ADMIN_ACTION / CLOSED / MAX_POSITION_EXCEEDED</span>
+</code></pre></div>
+
+<h3 id="522-tryclaimlength-bufferclaim">5.2.2 tryClaim(length, bufferClaim)</h3>
+<p>零拷贝写入，直接给你返回 term buffer 里的一段内存，你写完 <code>commit()</code>：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">BufferClaim</span><span class="w"> </span><span class="n">claim</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">BufferClaim</span><span class="p">();</span><span class="w"> </span><span class="c1">// 复用</span>
+<span class="kt">long</span><span class="w"> </span><span class="n">result</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">pub</span><span class="p">.</span><span class="na">tryClaim</span><span class="p">(</span><span class="n">msgLength</span><span class="p">,</span><span class="w"> </span><span class="n">claim</span><span class="p">);</span>
+<span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">result</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">MutableDirectBuffer</span><span class="w"> </span><span class="n">dst</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">claim</span><span class="p">.</span><span class="na">buffer</span><span class="p">();</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">offset</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">claim</span><span class="p">.</span><span class="na">offset</span><span class="p">();</span>
+<span class="w">    </span><span class="n">dst</span><span class="p">.</span><span class="na">putLong</span><span class="p">(</span><span class="n">offset</span><span class="p">,</span><span class="w"> </span><span class="n">System</span><span class="p">.</span><span class="na">nanoTime</span><span class="p">());</span>
+<span class="w">    </span><span class="c1">// ... 写更多字段</span>
+<span class="w">    </span><span class="n">claim</span><span class="p">.</span><span class="na">commit</span><span class="p">();</span><span class="w">  </span><span class="c1">// 提交；如果异常路径要 abort()</span>
+<span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 与 offer 相同的负值语义</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><code>tryClaim</code> 的场景：
+- 消息大小提前已知；
+- 生成消息成本高（比如复杂计算），希望"在 term buffer 上直接写"，避免 heap→direct 拷贝；
+- 与 SBE encoder 配合，直接在 claim buffer 上 encode。</p>
+<p>⚠️ 只在 <code>ExclusivePublication</code> 上用 <code>tryClaim</code> 才最高效（<code>ConcurrentPublication.tryClaim</code> 内部要 CAS）。</p>
+<h3 id="523-offerbuffer-offset-length">5.2.3 offer(buffer[], offset[], length[]) —— 向量发送</h3>
+<p>一次把多段拷贝拼成一条 Aeron 消息：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">DirectBufferVector</span><span class="o">[]</span><span class="w"> </span><span class="n">vectors</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">DirectBufferVector</span><span class="o">[]</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">new</span><span class="w"> </span><span class="n">DirectBufferVector</span><span class="p">(</span><span class="n">headerBuf</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">16</span><span class="p">),</span>
+<span class="w">    </span><span class="k">new</span><span class="w"> </span><span class="n">DirectBufferVector</span><span class="p">(</span><span class="n">bodyBuf</span><span class="p">,</span><span class="w">   </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">128</span><span class="p">)</span>
+<span class="p">};</span>
+<span class="kt">long</span><span class="w"> </span><span class="n">r</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">pub</span><span class="p">.</span><span class="na">offer</span><span class="p">(</span><span class="n">vectors</span><span class="p">);</span>
+</code></pre></div>
+
+<p>省一次业务侧的合并拷贝。</p>
+<h2 id="53-publication">5.3 Publication 是"连接尚未就绪"的</h2>
+<p><code>addPublication()</code> 返回后并不立刻可用：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">Publication</span><span class="w"> </span><span class="n">pub</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">aeron</span><span class="p">.</span><span class="na">addPublication</span><span class="p">(</span><span class="n">CHANNEL</span><span class="p">,</span><span class="w"> </span><span class="n">STREAM_ID</span><span class="p">);</span>
+<span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">pub</span><span class="p">.</span><span class="na">isConnected</span><span class="p">())</span><span class="w"> </span><span class="n">Thread</span><span class="p">.</span><span class="na">yield</span><span class="p">();</span><span class="w">   </span><span class="c1">// ← 关键</span>
+</code></pre></div>
+
+<p><code>isConnected()</code> 变 true 的时机：
+- IPC：等 driver 里有至少一个 Subscription 打到同一 stream 上；
+- UDP：等对方 Subscription 通过 SM (status message) 表明自己在监听。</p>
+<h2 id="54-stream-position-term">5.4 stream position 与 term</h2>
+<p>Aeron 内部把流按 term 切段（term buffer 是"某个 term 的存储"）：</p>
+<div class="codehilite"><pre><span></span><code>term_id=0, offset=0..(T-1)    term_id=1, offset=0..(T-1)    ...
+├──────────── term 0 ─────────┤├────────── term 1 ────────┤
+
+stream position = term_id * T + term_offset
+</code></pre></div>
+
+<p>Publication 上可读：</p>
+<div class="codehilite"><pre><span></span><code><span class="kt">long</span><span class="w"> </span><span class="n">pos</span><span class="w">       </span><span class="o">=</span><span class="w"> </span><span class="n">pub</span><span class="p">.</span><span class="na">position</span><span class="p">();</span>
+<span class="kt">int</span><span class="w">  </span><span class="n">termId</span><span class="w">    </span><span class="o">=</span><span class="w"> </span><span class="n">pub</span><span class="p">.</span><span class="na">termId</span><span class="p">();</span>
+<span class="kt">int</span><span class="w">  </span><span class="n">termOffset</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">pub</span><span class="p">.</span><span class="na">termOffset</span><span class="p">();</span>
+<span class="kt">int</span><span class="w">  </span><span class="n">initialTermId</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">pub</span><span class="p">.</span><span class="na">initialTermId</span><span class="p">();</span>
+<span class="kt">int</span><span class="w">  </span><span class="n">termBufferLength</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">pub</span><span class="p">.</span><span class="na">termBufferLength</span><span class="p">();</span>
+</code></pre></div>
+
+<p>用途：监控 / 调试 / 打 checkpoint。</p>
+<h2 id="55-publication">5.5 Publication 的生命周期</h2>
+<div class="codehilite"><pre><span></span><code>addPublication ──► not connected ──► connected ──► closed
+        (0..N ms)                              │
+                                               ▼
+                                       (可能变成 not connected：所有 sub 掉线)
+</code></pre></div>
+
+<p><strong>状态机可视化</strong>：</p>
+<pre class="mermaid">
+stateDiagram-v2
+    [*] --> NotConnected: addPublication()
+    NotConnected --> Connected: 有 Subscription 加入
+    Connected --> NotConnected: 所有 Subscription 掉线
+    Connected --> Closed: close()
+    NotConnected --> Closed: close()
+    Closed --> [*]
+
+    note right of NotConnected
+        offer() 返回 -1
+    end note
+    note right of Connected
+        offer() 可能成功或 BACK_PRESSURED
+    end note
+</pre>
+
+<h2 id="551-offer-vs-tryclaim">5.5.1 offer vs tryClaim 数据流对比</h2>
+<pre class="mermaid">
+flowchart LR
+    subgraph OFFER["offer 路径（有拷贝）"]
+        BUS1[业务对象] -->|序列化| UB1[UnsafeBuffer]
+        UB1 -->|memcpy| TB1[Term Buffer]
+    end
+    subgraph CLAIM["tryClaim 路径（零拷贝）"]
+        BUS2[业务对象] -->|直接写字段| TB2[Term Buffer]
+    end
+    style OFFER fill:#fde8e8
+    style CLAIM fill:#caffbf
+</pre>
+
+<ul>
+<li>一个 Publication 可以经历多次"connected → not connected → connected"（订阅端来来去去）</li>
+<li><code>Publication.close()</code> 是幂等的，多次关闭无害</li>
+<li>使用 try-with-resources 是最简单的方式</li>
+</ul>
+<h2 id="56">5.6 多线程调用规则</h2>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>建议</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>单线程 producer</td>
+<td><code>ExclusivePublication</code></td>
+</tr>
+<tr>
+<td>多线程 producer 且性能不敏感</td>
+<td><code>ConcurrentPublication</code>（默认）</td>
+</tr>
+<tr>
+<td>多线程 producer 且需要低延迟</td>
+<td>每线程一个 <code>ExclusivePublication</code>（不同 sessionId），下游多路合并</td>
+</tr>
+</tbody>
+</table>
+<h2 id="57">5.7 一段可运行示例</h2>
+<p>放到 <code>demo05_extra/ExclusivePubDemo.java</code> 就能跑：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">try</span><span class="w"> </span><span class="p">(</span><span class="n">MediaDriver</span><span class="w"> </span><span class="n">driver</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">MediaDriver</span><span class="p">.</span><span class="na">launchEmbedded</span><span class="p">();</span>
+<span class="w">     </span><span class="n">Aeron</span><span class="w"> </span><span class="n">aeron</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Aeron</span><span class="p">.</span><span class="na">connect</span><span class="p">(</span><span class="k">new</span><span class="w"> </span><span class="n">Aeron</span><span class="p">.</span><span class="na">Context</span><span class="p">()</span>
+<span class="w">             </span><span class="p">.</span><span class="na">aeronDirectoryName</span><span class="p">(</span><span class="n">driver</span><span class="p">.</span><span class="na">aeronDirectoryName</span><span class="p">()));</span>
+<span class="w">     </span><span class="n">ExclusivePublication</span><span class="w"> </span><span class="n">pub</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">aeron</span><span class="p">.</span><span class="na">addExclusivePublication</span><span class="p">(</span><span class="s">&quot;aeron:ipc&quot;</span><span class="p">,</span><span class="w"> </span><span class="mi">42</span><span class="p">);</span>
+<span class="w">     </span><span class="n">Subscription</span><span class="w"> </span><span class="n">sub</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">aeron</span><span class="p">.</span><span class="na">addSubscription</span><span class="p">(</span><span class="s">&quot;aeron:ipc&quot;</span><span class="p">,</span><span class="w"> </span><span class="mi">42</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">pub</span><span class="p">.</span><span class="na">isConnected</span><span class="p">()</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="o">!</span><span class="n">sub</span><span class="p">.</span><span class="na">isConnected</span><span class="p">())</span><span class="w"> </span><span class="n">Thread</span><span class="p">.</span><span class="na">yield</span><span class="p">();</span>
+
+<span class="w">    </span><span class="n">BufferClaim</span><span class="w"> </span><span class="n">claim</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">BufferClaim</span><span class="p">();</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kt">long</span><span class="w"> </span><span class="n">r</span><span class="p">;</span>
+<span class="w">        </span><span class="k">while</span><span class="w"> </span><span class="p">((</span><span class="n">r</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">pub</span><span class="p">.</span><span class="na">tryClaim</span><span class="p">(</span><span class="mi">16</span><span class="p">,</span><span class="w"> </span><span class="n">claim</span><span class="p">))</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="n">Thread</span><span class="p">.</span><span class="na">yield</span><span class="p">();</span>
+<span class="w">        </span><span class="n">MutableDirectBuffer</span><span class="w"> </span><span class="n">buf</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">claim</span><span class="p">.</span><span class="na">buffer</span><span class="p">();</span>
+<span class="w">        </span><span class="kt">int</span><span class="w"> </span><span class="n">off</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">claim</span><span class="p">.</span><span class="na">offset</span><span class="p">();</span>
+<span class="w">        </span><span class="n">buf</span><span class="p">.</span><span class="na">putLong</span><span class="p">(</span><span class="n">off</span><span class="p">,</span><span class="w"> </span><span class="n">System</span><span class="p">.</span><span class="na">nanoTime</span><span class="p">());</span>
+<span class="w">        </span><span class="n">buf</span><span class="p">.</span><span class="na">putInt</span><span class="p">(</span><span class="n">off</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span><span class="w"> </span><span class="n">i</span><span class="p">);</span>
+<span class="w">        </span><span class="n">claim</span><span class="p">.</span><span class="na">commit</span><span class="p">();</span>
+<span class="w">        </span><span class="n">log</span><span class="p">.</span><span class="na">info</span><span class="p">(</span><span class="s">&quot;tryClaim 发送 i={} pos={}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">i</span><span class="p">,</span><span class="w"> </span><span class="n">r</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kt">long</span><span class="w"> </span><span class="n">deadline</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">System</span><span class="p">.</span><span class="na">currentTimeMillis</span><span class="p">()</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">500</span><span class="p">;</span>
+<span class="w">    </span><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="n">System</span><span class="p">.</span><span class="na">currentTimeMillis</span><span class="p">()</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">deadline</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">sub</span><span class="p">.</span><span class="na">poll</span><span class="p">((</span><span class="n">b</span><span class="p">,</span><span class="w"> </span><span class="n">o</span><span class="p">,</span><span class="w"> </span><span class="n">l</span><span class="p">,</span><span class="w"> </span><span class="n">h</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="kt">long</span><span class="w"> </span><span class="n">ts</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">b</span><span class="p">.</span><span class="na">getLong</span><span class="p">(</span><span class="n">o</span><span class="p">);</span>
+<span class="w">            </span><span class="kt">int</span><span class="w">  </span><span class="n">i</span><span class="w">  </span><span class="o">=</span><span class="w"> </span><span class="n">b</span><span class="p">.</span><span class="na">getInt</span><span class="p">(</span><span class="n">o</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">8</span><span class="p">);</span>
+<span class="w">            </span><span class="n">log</span><span class="p">.</span><span class="na">info</span><span class="p">(</span><span class="s">&quot;收到 i={} ts={}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">i</span><span class="p">,</span><span class="w"> </span><span class="n">ts</span><span class="p">);</span>
+<span class="w">        </span><span class="p">},</span><span class="w"> </span><span class="mi">10</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h2 id="58">5.8 小结</h2>
+<ul>
+<li>Publication 是 Aeron 的发送句柄，先 <code>isConnected()</code> 再 offer</li>
+<li><code>ExclusivePublication</code> + <code>tryClaim</code> 是零拷贝写入的黄金组合</li>
+<li>生产系统对每一个 <code>long r = offer(...)</code> 都要处理返回值（Ch08）</li>
+</ul>
+<nav class="chapter-nav"><a href="ch04-media-driver.html" class="nav-link">← 第 04 章 · MediaDriver：从嵌入式到独立部署</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch06-subscription.html" class="nav-link next">第 06 章 · Subscription 与消费模型 →</a></nav>
+</article>
+<script>
+  // 高亮所有非 mermaid 代码块
+  document.querySelectorAll('pre code:not(.language-mermaid)').forEach(el => {
+    if (window.hljs) hljs.highlightElement(el);
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 23 章 · 部署、监控、性能调优</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-light.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/index.min.js"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose" });
+</script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+                 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2em 1em 4em;
+    background: #fafafa;
+    color: #24292f;
+  }
+  .markdown-body {
+    background: #ffffff;
+    padding: 2.5em 3em;
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+  }
+  .markdown-body pre {
+    background: #f6f8fa !important;
+  }
+  .markdown-body pre.mermaid {
+    background: transparent !important;
+    text-align: center;
+    padding: 1em;
+  }
+  nav.chapter-nav {
+    display: flex;
+    justify-content: space-between;
+    padding: 1em;
+    margin-bottom: 1.5em;
+    background: #eef2f7;
+    border-radius: 8px;
+    font-size: 0.95em;
+  }
+  nav.chapter-nav a {
+    color: #0969da;
+    text-decoration: none;
+  }
+  nav.chapter-nav a:hover { text-decoration: underline; }
+  nav.chapter-nav .nav-link { min-width: 30%; }
+  nav.chapter-nav .nav-link.next { text-align: right; }
+  nav.chapter-nav .nav-link.home { text-align: center; }
+</style>
+</head>
+<body>
+<article class="markdown-body">
+<nav class="chapter-nav"><a href="ch22-clustered-service.html" class="nav-link">← 第 22 章 · 编写一个 Clustered Service</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch24-troubleshooting.html" class="nav-link next">第 24 章 · 常见错误与排错手册 →</a></nav>
+<h1 id="23">第 23 章 · 部署、监控、性能调优</h1>
+<h2 id="_1">学习目标</h2>
+<ul>
+<li>学会独立部署 MediaDriver / Archive 的 systemd unit；</li>
+<li>掌握 Linux 上的核心 tuning：hugepages、tmpfs、绑核；</li>
+<li>会做基准测试，识别延迟瓶颈；</li>
+<li>掌握生产必备的监控指标。</li>
+</ul>
+<h2 id="_2">本章速览：生产部署拓扑</h2>
+<pre class="mermaid">
+flowchart TB
+    subgraph HOST["物理机 / 裸金属"]
+        subgraph OS["Linux 内核调优"]
+            SHM["/dev/shm tmpfs<br/>存 aeron 目录"]
+            HP[hugepages]
+            SB[so_rcvbuf/so_sndbuf 128MB]
+        end
+        subgraph SYS["systemd 管理"]
+            MD[aeron-driver.service<br/>绑核 CPU 2,3,4]
+            AR[aeron-archive.service<br/>绑核 CPU 5]
+        end
+        subgraph BIZ["业务进程"]
+            APP1[market-gateway<br/>绑核 CPU 6,7]
+            APP2[strategy-engine<br/>绑核 CPU 8,9]
+        end
+    end
+    subgraph MON["监控栈"]
+        AS[AeronStat CLI]
+        PROM[Prometheus exporter]
+        DASH[Grafana Dashboard]
+    end
+    MD --> SHM
+    AR --> SHM
+    APP1 --> SHM
+    APP2 --> SHM
+    AS -->|mmap cnc.dat| SHM
+    PROM -->|读 counter| SHM
+    PROM --> DASH
+    style SHM fill:#caffbf
+    style MD fill:#a0c4ff
+    style APP1 fill:#fef3c7
+    style APP2 fill:#fef3c7
+</pre>
+
+<h2 id="231-mediadriver">23.1 独立部署 MediaDriver</h2>
+<p><code>/etc/systemd/system/aeron-driver.service</code>：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">[Unit]</span>
+<span class="na">Description</span><span class="o">=</span><span class="s">Aeron Media Driver</span>
+<span class="na">After</span><span class="o">=</span><span class="s">network.target</span>
+
+<span class="k">[Service]</span>
+<span class="na">Type</span><span class="o">=</span><span class="s">simple</span>
+<span class="na">User</span><span class="o">=</span><span class="s">aeron</span>
+<span class="na">Group</span><span class="o">=</span><span class="s">aeron</span>
+<span class="na">LimitNOFILE</span><span class="o">=</span><span class="s">100000</span>
+<span class="na">LimitMEMLOCK</span><span class="o">=</span><span class="s">infinity</span>
+<span class="na">Environment</span><span class="o">=</span><span class="s">&quot;JAVA_HOME=/usr/lib/jvm/java-21-openjdk&quot;</span>
+<span class="na">ExecStart</span><span class="o">=</span><span class="s">/usr/lib/jvm/java-21-openjdk/bin/java </span>\
+<span class="w">    </span><span class="s">-Xms1g -Xmx1g </span>\
+<span class="w">    </span><span class="s">-XX:+AlwaysPreTouch </span>\
+<span class="w">    </span><span class="s">-XX:+UseNUMA </span>\
+<span class="w">    </span><span class="s">-Daeron.dir=/dev/shm/aeron-prod </span>\
+<span class="w">    </span><span class="s">-Daeron.threading.mode=DEDICATED </span>\
+<span class="w">    </span><span class="s">-Daeron.mtu.length=8192 </span>\
+<span class="w">    </span><span class="s">-Daeron.term.buffer.length=16777216 </span>\
+<span class="w">    </span><span class="s">-Daeron.ipc.term.buffer.length=16777216 </span>\
+<span class="w">    </span><span class="s">-jar /opt/aeron/aeron-driver.jar</span>
+<span class="na">Restart</span><span class="o">=</span><span class="s">always</span>
+<span class="na">RestartSec</span><span class="o">=</span><span class="s">1</span>
+
+<span class="k">[Install]</span>
+<span class="na">WantedBy</span><span class="o">=</span><span class="s">multi-user.target</span>
+</code></pre></div>
+
+<p>启动：</p>
+<div class="codehilite"><pre><span></span><code>sudo<span class="w"> </span>systemctl<span class="w"> </span>daemon-reload
+sudo<span class="w"> </span>systemctl<span class="w"> </span><span class="nb">enable</span><span class="w"> </span>--now<span class="w"> </span>aeron-driver
+journalctl<span class="w"> </span>-u<span class="w"> </span>aeron-driver<span class="w"> </span>-f
+</code></pre></div>
+
+<h2 id="232-aeron-java">23.2 Aeron Java 属性</h2>
+<p>除了 Context API，Aeron 也允许通过 <code>-Daeron.*=value</code> 配置，方便运维改配置不改代码。常用：</p>
+<div class="codehilite"><pre><span></span><code>-Daeron.dir=/dev/shm/aeron-prod
+-Daeron.threading.mode=DEDICATED
+-Daeron.mtu.length=8192
+-Daeron.term.buffer.length=16777216
+-Daeron.ipc.term.buffer.length=16777216
+-Daeron.client.liveness.timeout=10000000000     # 10 s
+-Daeron.publication.unblock.timeout=15000000000
+-Daeron.socket.so_sndbuf=2097152
+-Daeron.socket.so_rcvbuf=2097152
+</code></pre></div>
+
+<h2 id="233-linux-tuning">23.3 Linux 核心 tuning</h2>
+<h3 id="2331-tmpfs-aeron-dir">23.3.1 tmpfs 存 aeron dir</h3>
+<div class="codehilite"><pre><span></span><code>mount<span class="w"> </span>-t<span class="w"> </span>tmpfs<span class="w"> </span>-o<span class="w"> </span><span class="nv">size</span><span class="o">=</span>8g<span class="w"> </span>tmpfs<span class="w"> </span>/dev/shm/aeron-prod
+</code></pre></div>
+
+<p>避免磁盘 IO 干扰 shared memory。</p>
+<h3 id="2332-udp-socket-buffer">23.3.2 UDP socket buffer</h3>
+<div class="codehilite"><pre><span></span><code>sysctl<span class="w"> </span>-w<span class="w"> </span>net.core.rmem_max<span class="o">=</span><span class="m">134217728</span>
+sysctl<span class="w"> </span>-w<span class="w"> </span>net.core.wmem_max<span class="o">=</span><span class="m">134217728</span>
+sysctl<span class="w"> </span>-w<span class="w"> </span>net.core.rmem_default<span class="o">=</span><span class="m">134217728</span>
+sysctl<span class="w"> </span>-w<span class="w"> </span>net.core.wmem_default<span class="o">=</span><span class="m">134217728</span>
+sysctl<span class="w"> </span>-w<span class="w"> </span>net.core.netdev_max_backlog<span class="o">=</span><span class="m">10000</span>
+</code></pre></div>
+
+<h3 id="2333-huge-pages">23.3.3 Huge Pages</h3>
+<p>对超大 term buffer 有帮助（&gt;= 256 MB）：</p>
+<div class="codehilite"><pre><span></span><code><span class="nb">echo</span><span class="w"> </span><span class="m">512</span><span class="w"> </span>&gt;<span class="w"> </span>/proc/sys/vm/nr_hugepages
+mount<span class="w"> </span>-t<span class="w"> </span>hugetlbfs<span class="w"> </span>nodev<span class="w"> </span>/dev/hugepages
+</code></pre></div>
+
+<p>Aeron 目前不直接支持 hugetlbfs，但 JVM 用 <code>-XX:+UseLargePages</code> 可以获得部分收益。</p>
+<h3 id="2334-isolcpus">23.3.4 绑核 / isolcpus</h3>
+<p>BIOS 关闭 hyperthreading（或用 SMT sibling 隔离）。GRUB：</p>
+<div class="codehilite"><pre><span></span><code>isolcpus=2,3,4,5 nohz_full=2,3,4,5 rcu_nocbs=2,3,4,5
+</code></pre></div>
+
+<p>启动时 <code>taskset -c 2 java -jar aeron-driver.jar</code>。
+线程内部用 <code>Affinity.setAffinity(...)</code>（<code>net.openhft:affinity</code>）。</p>
+<h2 id="234-jvm">23.4 JVM 参数</h2>
+<p>低延迟 Aeron 应用推荐：</p>
+<div class="codehilite"><pre><span></span><code>-Xms4g -Xmx4g                            # 固定堆
+-XX:+AlwaysPreTouch                      # 预分配堆
+-XX:+UseZGC                              # 或 Shenandoah / G1
+-XX:MaxGCPauseMillis=1                   # 目标 pause
+-XX:-UsePerfData                         # 关闭 hsperfdata
+-XX:+DisableExplicitGC                   # 忽略 System.gc()
+-Djava.util.concurrent.ForkJoinPool.common.parallelism=1
+</code></pre></div>
+
+<p>高频交易场景可能改成 Epsilon GC（不回收，服务重启前跑几小时）。</p>
+<h2 id="235">23.5 基准测试</h2>
+<p>Aeron 自带 <code>EmbeddedThroughput</code> / <code>Latency</code> samples：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 吞吐</span>
+java<span class="w"> </span>-cp<span class="w"> </span>aeron-samples-all.jar<span class="w"> </span>io.aeron.samples.EmbeddedThroughput
+
+<span class="c1"># RTT 延迟</span>
+java<span class="w"> </span>-cp<span class="w"> </span>aeron-samples-all.jar<span class="w"> </span>io.aeron.samples.Ping
+java<span class="w"> </span>-cp<span class="w"> </span>aeron-samples-all.jar<span class="w"> </span>io.aeron.samples.Pong
+</code></pre></div>
+
+<p>自定义 benchmark 用 JMH + HdrHistogram：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">HdrHistogram</span><span class="w"> </span><span class="n">histogram</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">Histogram</span><span class="p">(</span><span class="n">TimeUnit</span><span class="p">.</span><span class="na">SECONDS</span><span class="p">.</span><span class="na">toNanos</span><span class="p">(</span><span class="mi">10</span><span class="p">),</span><span class="w"> </span><span class="mi">3</span><span class="p">);</span>
+<span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">10_000_000</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">long</span><span class="w"> </span><span class="n">t0</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">System</span><span class="p">.</span><span class="na">nanoTime</span><span class="p">();</span>
+<span class="w">    </span><span class="c1">// do work</span>
+<span class="w">    </span><span class="n">histogram</span><span class="p">.</span><span class="na">recordValue</span><span class="p">(</span><span class="n">System</span><span class="p">.</span><span class="na">nanoTime</span><span class="p">()</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">t0</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="n">histogram</span><span class="p">.</span><span class="na">outputPercentileDistribution</span><span class="p">(</span><span class="n">System</span><span class="p">.</span><span class="na">out</span><span class="p">,</span><span class="w"> </span><span class="mf">1.0</span><span class="p">);</span>
+</code></pre></div>
+
+<p>关注 P50 / P99 / P99.99。</p>
+<h2 id="236">23.6 常见延迟数字（参考）</h2>
+<p><strong>直观量级图</strong>：</p>
+<div class="codehilite"><pre><span></span><code>路径                       中位数    ▁▂▃▅▆▇█
+─────────────────────────────────────────────────
+IPC 8 字节 one-way          200ns   ▁
+IPC 64 字节 one-way         600ns   ▁
+UDP LAN 10GbE               8μs     ▃
+UDP LAN 1GbE                15μs    ▅
+gRPC LAN                    500μs   ▇
+Kafka                       5ms     █
+
+同一台机器 → 用 IPC   跨机 → 用 UDP + 10GbE
+</code></pre></div>
+
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>中位数</th>
+<th>P99</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>IPC 8-byte one-way</td>
+<td>200~500 ns</td>
+<td>1~5 μs</td>
+</tr>
+<tr>
+<td>IPC 64-byte one-way</td>
+<td>500 ns~1 μs</td>
+<td>5~10 μs</td>
+</tr>
+<tr>
+<td>UDP LAN 1 GbE</td>
+<td>5~20 μs</td>
+<td>20~50 μs</td>
+</tr>
+<tr>
+<td>UDP LAN 10 GbE</td>
+<td>3~10 μs</td>
+<td>15~30 μs</td>
+</tr>
+<tr>
+<td>UDP LAN 25 GbE + kernel bypass</td>
+<td>&lt;5 μs</td>
+<td>&lt;15 μs</td>
+</tr>
+</tbody>
+</table>
+<p>超出这些数字 2x 以上就要开始 profile。</p>
+<h2 id="237">23.7 监控指标</h2>
+<p>必须监控的 counter：</p>
+<table>
+<thead>
+<tr>
+<th>Counter</th>
+<th>阈值建议</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>bytes_sent</code> / <code>bytes_received</code></td>
+<td>波动异常</td>
+</tr>
+<tr>
+<td><code>publisher_back_pressured</code></td>
+<td>每秒增长 &gt; 100</td>
+</tr>
+<tr>
+<td><code>publisher_unblock</code></td>
+<td>出现即告警</td>
+</tr>
+<tr>
+<td><code>loss_gap_fills</code></td>
+<td>每秒 &gt; 0 就要看</td>
+</tr>
+<tr>
+<td><code>loss report file</code></td>
+<td>出现新条目告警</td>
+</tr>
+<tr>
+<td><code>errors</code></td>
+<td>&gt; 0 告警</td>
+</tr>
+<tr>
+<td><code>sub-pos vs pub-pos</code></td>
+<td>差距 &gt; 1 MB 告警</td>
+</tr>
+</tbody>
+</table>
+<p>工具：Prometheus exporter 有社区实现（<code>aeron-agent</code> 里也有）。</p>
+<h2 id="238">23.8 常见性能陷阱</h2>
+<ol>
+<li><strong>term buffer 太小</strong>：BackPressure 频繁。</li>
+<li><strong>Publisher 每次 offer 前 log.info</strong>：日志阻塞主线程。</li>
+<li><strong>多个 Aeron client 复用一个线程 poll 但没设 IdleStrategy</strong>：CPU 100%。</li>
+<li><strong>JIT 未 warmup 就跑正式流量</strong>：前几分钟延迟 10 倍。</li>
+<li><strong>GC 未调优</strong>：ZGC 之前用 G1，Full GC pause 秒级。</li>
+<li><strong>忘了 <code>PreTouch</code></strong>：第一次访问堆页产生 page fault。</li>
+<li><strong>kernel version 老</strong>：&lt; 5.4 的 UDP 性能有 bug。</li>
+</ol>
+<h2 id="239">23.9 日志建议</h2>
+<ul>
+<li><strong>不要</strong>在热路径打日志，或者用 log4j2 async + gc-free；</li>
+<li>使用 <code>LOG.isDebugEnabled()</code> guard；</li>
+<li>生产日志级别 INFO 及以上，把 <code>io.aeron</code> 压到 WARN。</li>
+</ul>
+<h2 id="2310">23.10 小结</h2>
+<ul>
+<li>独立部署 MediaDriver，systemd 管</li>
+<li>tmpfs + hugepage + 绑核是 Linux 侧三板斧</li>
+<li>JVM 用 ZGC + AlwaysPreTouch</li>
+<li>监控 counter 是排障基础</li>
+</ul>
+<nav class="chapter-nav"><a href="ch22-clustered-service.html" class="nav-link">← 第 22 章 · 编写一个 Clustered Service</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch24-troubleshooting.html" class="nav-link next">第 24 章 · 常见错误与排错手册 →</a></nav>
+</article>
+<script>
+  // 高亮所有非 mermaid 代码块
+  document.querySelectorAll('pre code:not(.language-mermaid)').forEach(el => {
+    if (window.hljs) hljs.highlightElement(el);
+  });
+</script>
+</body>
+</html>

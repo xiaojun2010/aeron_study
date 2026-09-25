@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 07 章 · Channel URI 完全指南</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-light.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/index.min.js"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose" });
+</script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+                 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2em 1em 4em;
+    background: #fafafa;
+    color: #24292f;
+  }
+  .markdown-body {
+    background: #ffffff;
+    padding: 2.5em 3em;
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+  }
+  .markdown-body pre {
+    background: #f6f8fa !important;
+  }
+  .markdown-body pre.mermaid {
+    background: transparent !important;
+    text-align: center;
+    padding: 1em;
+  }
+  nav.chapter-nav {
+    display: flex;
+    justify-content: space-between;
+    padding: 1em;
+    margin-bottom: 1.5em;
+    background: #eef2f7;
+    border-radius: 8px;
+    font-size: 0.95em;
+  }
+  nav.chapter-nav a {
+    color: #0969da;
+    text-decoration: none;
+  }
+  nav.chapter-nav a:hover { text-decoration: underline; }
+  nav.chapter-nav .nav-link { min-width: 30%; }
+  nav.chapter-nav .nav-link.next { text-align: right; }
+  nav.chapter-nav .nav-link.home { text-align: center; }
+</style>
+</head>
+<body>
+<article class="markdown-body">
+<nav class="chapter-nav"><a href="ch06-subscription.html" class="nav-link">← 第 06 章 · Subscription 与消费模型</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch08-offer-backpressure.html" class="nav-link next">第 08 章 · offer 返回值与 Back Pressure →</a></nav>
+<h1 id="07-channel-uri">第 07 章 · Channel URI 完全指南</h1>
+<h2 id="_1">学习目标</h2>
+<ul>
+<li>认全 <code>aeron:ipc</code> / <code>aeron:udp</code> 的参数；</li>
+<li>学会写 unicast / multicast / MDC 的 URI；</li>
+<li>掌握 <code>ChannelUriStringBuilder</code> 优雅构造；</li>
+<li>知道每个参数背后的物理意义（sessionId, MTU, term-length, initial-term-id…）。</li>
+</ul>
+<h2 id="uri">本章速览：URI 长什么样</h2>
+<div class="codehilite"><pre><span></span><code>aeron:udp?endpoint=192.168.1.20:40456|mtu=8192|term-length=16777216|alias=market
+─────  ────                              ──── ──────────────── ─────
+ 前缀  介质        目的地址                  分片   term 大小       别名
+                                          单位     单位=字节
+                    ▲                     ▲
+                    │                     │
+              收方绑定地址             键值对用 | 分隔（不是 &amp;！）
+</code></pre></div>
+
+<p><strong>类比</strong>：URI 像一封信封上的完整地址：介质（陆运/空运）+ 目的地 + 特快专递选项。</p>
+<pre class="mermaid">
+flowchart LR
+    START[需要写 Channel] --> Q{介质?}
+    Q -->|同机| IPC["aeron:ipc"]
+    Q -->|点对点跨机| U1["aeron:udp?endpoint=..."]
+    Q -->|一发多收 LAN| U2["aeron:udp?endpoint=239.x.y.z:port"]
+    Q -->|一发多收 云| U3["aeron:udp?control=...|control-mode=dynamic"]
+    style IPC fill:#caffbf
+    style U1 fill:#a0c4ff
+    style U2 fill:#fdffb6
+    style U3 fill:#ffd6a5
+</pre>
+
+<h2 id="71-uri">7.1 URI 基本形式</h2>
+<div class="codehilite"><pre><span></span><code>aeron:ipc[?key1=value1|key2=value2|...]
+aeron:udp[?key1=value1|key2=value2|...]
+</code></pre></div>
+
+<p>分隔符是 <strong><code>|</code></strong>（不是 <code>&amp;</code>），初学者最容易写错。</p>
+<h2 id="72-ipc">7.2 常见 IPC 组合</h2>
+<div class="codehilite"><pre><span></span><code><span class="s">&quot;aeron:ipc&quot;</span><span class="w">                                    </span><span class="c1">// 最简单</span>
+<span class="s">&quot;aeron:ipc?term-length=1048576&quot;</span><span class="w">                </span><span class="c1">// 指定 term buffer 1 MB</span>
+<span class="s">&quot;aeron:ipc?alias=market-data&quot;</span><span class="w">                  </span><span class="c1">// 起个别名，方便 CncFileReader 观察</span>
+</code></pre></div>
+
+<h2 id="73-udp">7.3 常见 UDP 组合</h2>
+<div class="codehilite"><pre><span></span><code>aeron:udp?endpoint=&lt;host:port&gt;                                       # 单播
+aeron:udp?endpoint=224.0.0.1:40456|interface=eth0                    # 组播 + 指定网卡
+aeron:udp?control=host:port|control-mode=dynamic                     # MDC，Ch17
+aeron:udp?endpoint=host:port|mtu=8192|term-length=16777216           # 大包 + 大 term
+aeron:udp?endpoint=host:port|ttl=8                                   # 组播 TTL
+</code></pre></div>
+
+<h2 id="74">7.4 参数一览</h2>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>值</th>
+<th>意义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>endpoint</code></td>
+<td><code>host:port</code></td>
+<td>收方绑定地址</td>
+</tr>
+<tr>
+<td><code>interface</code></td>
+<td><code>host[:port]</code></td>
+<td>发方使用的网卡地址</td>
+</tr>
+<tr>
+<td><code>control</code></td>
+<td><code>host:port</code></td>
+<td>MDC 的控制端点</td>
+</tr>
+<tr>
+<td><code>control-mode</code></td>
+<td><code>manual</code> / <code>dynamic</code></td>
+<td>MDC 模式</td>
+</tr>
+<tr>
+<td><code>mtu</code></td>
+<td>整数</td>
+<td>MTU 字节，超过则拆片。UDP 默认 1408</td>
+</tr>
+<tr>
+<td><code>term-length</code></td>
+<td>2 的幂，最大 1 GB</td>
+<td>单个 term buffer 大小</td>
+</tr>
+<tr>
+<td><code>init-term-id</code> / <code>term-id</code> / <code>term-offset</code></td>
+<td>整数</td>
+<td>手工指定起始位置（Archive replay 常用）</td>
+</tr>
+<tr>
+<td><code>session-id</code></td>
+<td>32-bit</td>
+<td>手动指定 sessionId</td>
+</tr>
+<tr>
+<td><code>linger</code></td>
+<td>纳秒</td>
+<td>Publication 关闭后保留时间，方便迟到订阅者</td>
+</tr>
+<tr>
+<td><code>reliable</code></td>
+<td>true/false</td>
+<td>是否启用重传（默认 true）</td>
+</tr>
+<tr>
+<td><code>tags</code></td>
+<td>逗号分隔</td>
+<td>给 driver 打 tag，可通过 tag 引用</td>
+</tr>
+<tr>
+<td><code>alias</code></td>
+<td>字符串</td>
+<td>别名（cnc 中显示）</td>
+</tr>
+<tr>
+<td><code>sparse</code></td>
+<td>true/false</td>
+<td>term 文件是否稀疏</td>
+</tr>
+<tr>
+<td><code>so-sndbuf</code> / <code>so-rcvbuf</code></td>
+<td>字节数</td>
+<td>socket send/receive buffer</td>
+</tr>
+<tr>
+<td><code>ttl</code></td>
+<td>1~255</td>
+<td>多播 TTL</td>
+</tr>
+</tbody>
+</table>
+<h2 id="75-channeluristringbuilder">7.5 优雅构造：ChannelUriStringBuilder</h2>
+<p>字符串拼接容易出错，官方给了 builder：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">String</span><span class="w"> </span><span class="n">channel</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">ChannelUriStringBuilder</span><span class="p">()</span>
+<span class="w">    </span><span class="p">.</span><span class="na">media</span><span class="p">(</span><span class="s">&quot;udp&quot;</span><span class="p">)</span>
+<span class="w">    </span><span class="p">.</span><span class="na">endpoint</span><span class="p">(</span><span class="s">&quot;192.168.1.20:40456&quot;</span><span class="p">)</span>
+<span class="w">    </span><span class="p">.</span><span class="na">mtu</span><span class="p">(</span><span class="mi">8192</span><span class="p">)</span>
+<span class="w">    </span><span class="p">.</span><span class="na">termLength</span><span class="p">(</span><span class="mi">16</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">1024</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">1024</span><span class="p">)</span>
+<span class="w">    </span><span class="p">.</span><span class="na">reliable</span><span class="p">(</span><span class="kc">true</span><span class="p">)</span>
+<span class="w">    </span><span class="p">.</span><span class="na">alias</span><span class="p">(</span><span class="s">&quot;market-data&quot;</span><span class="p">)</span>
+<span class="w">    </span><span class="p">.</span><span class="na">build</span><span class="p">();</span>
+<span class="c1">// aeron:udp?endpoint=192.168.1.20:40456|mtu=8192|term-length=16777216|reliable=true|alias=market-data</span>
+</code></pre></div>
+
+<h2 id="76-ipc-vs-udp">7.6 IPC vs UDP 参数差异</h2>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>IPC</th>
+<th>UDP</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>endpoint</code></td>
+<td>✘</td>
+<td>✔ 必须</td>
+</tr>
+<tr>
+<td><code>mtu</code></td>
+<td>与 ipc-mtu-length 全局配置有关，一般不用</td>
+<td>关键</td>
+</tr>
+<tr>
+<td><code>term-length</code></td>
+<td>用 <code>ipcPublicationTermBufferLength</code></td>
+<td>用 <code>publicationTermBufferLength</code></td>
+</tr>
+<tr>
+<td><code>control-mode</code></td>
+<td>✘</td>
+<td>✔（MDC）</td>
+</tr>
+</tbody>
+</table>
+<h2 id="77-session-id-uri">7.7 Session ID 与 URI</h2>
+<p>不指定 <code>session-id</code> 时，driver 会随机分配。手动指定的场景：</p>
+<ul>
+<li><strong>Aeron Archive replay</strong>：让 replay 出来的流带上原始 sessionId；</li>
+<li><strong>Deterministic testing</strong>：让测试可重现；</li>
+<li><strong>Cluster consensus module</strong>：cluster 内部固定 sessionId 用于内部通信。</li>
+</ul>
+<div class="codehilite"><pre><span></span><code><span class="n">String</span><span class="w"> </span><span class="n">pubChannel</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">&quot;aeron:udp?endpoint=host:port|session-id=12345&quot;</span><span class="p">;</span>
+<span class="c1">// 对应 Subscription 侧可以 filter 只收这个 sessionId</span>
+</code></pre></div>
+
+<h2 id="78-uri">7.8 URI 一致性要求</h2>
+<p>Publisher 和 Subscriber 的 URI 允许"发方多参数，收方少参数"，但 <strong>endpoint / term-length / mtu 必须匹配</strong>。常见组合：</p>
+<ul>
+<li>Publisher: <code>aeron:udp?endpoint=host:port|mtu=8192|term-length=16M</code></li>
+<li>Subscriber: <code>aeron:udp?endpoint=host:port|term-length=16M</code></li>
+</ul>
+<h2 id="79">7.9 跨机部署的实际写法</h2>
+<p>场景：Machine A 发 → Machine B 收</p>
+<p>Machine B（订阅方）：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">String</span><span class="w"> </span><span class="n">sub</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">&quot;aeron:udp?endpoint=0.0.0.0:40456|term-length=16m&quot;</span><span class="p">;</span><span class="w">  </span><span class="c1">// 监听全部网卡</span>
+<span class="n">Subscription</span><span class="w"> </span><span class="n">s</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">aeron</span><span class="p">.</span><span class="na">addSubscription</span><span class="p">(</span><span class="n">sub</span><span class="p">,</span><span class="w"> </span><span class="mi">1001</span><span class="p">);</span>
+</code></pre></div>
+
+<p>Machine A（发布方）：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">String</span><span class="w"> </span><span class="n">pub</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">&quot;aeron:udp?endpoint=192.168.1.20:40456|term-length=16m&quot;</span><span class="p">;</span>
+<span class="n">Publication</span><span class="w"> </span><span class="n">p</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">aeron</span><span class="p">.</span><span class="na">addPublication</span><span class="p">(</span><span class="n">pub</span><span class="p">,</span><span class="w"> </span><span class="mi">1001</span><span class="p">);</span>
+</code></pre></div>
+
+<p>注意：
+- 收方常用 <code>0.0.0.0</code> 表示监听所有网卡；
+- term-length 建议双方一致，方便对账；
+- 防火墙要放开 UDP 40456。</p>
+<h2 id="710-alias-cnc">7.10 Alias 与 Cnc</h2>
+<p>给 URI 加上 <code>alias=...</code>，你在 <code>AeronStat</code> / <code>CncFileReader</code> 里就能看见友好的名字，排查方便：</p>
+<div class="codehilite"><pre><span></span><code>java<span class="w"> </span>-cp<span class="w"> </span>aeron-samples.jar<span class="w"> </span>io.aeron.samples.AeronStat
+<span class="c1"># 列出所有 counter，包含 alias</span>
+</code></pre></div>
+
+<h2 id="711">7.11 小结</h2>
+<ul>
+<li>URI 是 Aeron 唯一"通道地址"表达方式；</li>
+<li>复杂场景用 <code>ChannelUriStringBuilder</code>；</li>
+<li>Publisher / Subscriber URI 不需要完全相同，但 endpoint/term-length/mtu 要一致；</li>
+<li>Ch16 讲 multicast，Ch17 讲 MDC，会用到 <code>control</code> / <code>control-mode</code> 参数。</li>
+</ul>
+<nav class="chapter-nav"><a href="ch06-subscription.html" class="nav-link">← 第 06 章 · Subscription 与消费模型</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch08-offer-backpressure.html" class="nav-link next">第 08 章 · offer 返回值与 Back Pressure →</a></nav>
+</article>
+<script>
+  // 高亮所有非 mermaid 代码块
+  document.querySelectorAll('pre code:not(.language-mermaid)').forEach(el => {
+    if (window.hljs) hljs.highlightElement(el);
+  });
+</script>
+</body>
+</html>

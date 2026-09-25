@@ -7,6 +7,24 @@
 - 掌握 replay 与 live subscription 的 sessionId / position 对齐；
 - 认识 aeron-cookbook 里 `archive-replay-merge` 的骨架。
 
+## 本章速览：为什么需要 Replay-Merge
+
+```mermaid
+flowchart LR
+    subgraph BAD["朴素方案（有坑）"]
+        BB1[1. replay 0→now] --> BB2[2. 补完后 addSub]
+        BB2 --> BB3[3. 但补的时候直播还在跑]
+        BB3 --> BB4[4. 中间漏了一段！]
+        style BB4 fill:#fde8e8
+    end
+    subgraph GOOD["ReplayMerge（无缝）"]
+        GG1[启动 ReplayMerge] --> GG2[边补历史边跟直播]
+        GG2 --> GG3[追赶到直播位置]
+        GG3 --> GG4[无缝切到 live subscription]
+        style GG4 fill:#caffbf
+    end
+```
+
 ## 20.1 三种回放 API
 
 | API | 语义 |
@@ -72,6 +90,27 @@ STATE_CATCH_UP     ← replay 从 startPos 追到 live position
 STATE_ATTEMPT_LIVE ← 尝试加入 live channel
 STATE_MERGED       ← replay stop，subscription 只跟 live
 STATE_CLOSED
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> ResolveChannel
+    ResolveChannel --> CatchUp: 开始 replay
+    CatchUp --> CatchUp: 追赶 live 位置
+    CatchUp --> AttemptLive: 追上 live
+    AttemptLive --> Merged: 加入 live 成功
+    AttemptLive --> CatchUp: 差距重新拉大
+    Merged --> Closed: 关闭
+    Closed --> [*]
+
+    note right of CatchUp
+        既在 replay 中读历史
+        又在监控 live 位置
+    end note
+    note right of Merged
+        Replay 停止
+        Subscription 只跟 live
+    end note
 ```
 
 在切换的过程中，Aeron 保证消息 **不重不漏**，通过对齐 sessionId 和 position 实现。

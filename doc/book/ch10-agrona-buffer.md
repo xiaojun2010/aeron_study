@@ -7,6 +7,44 @@
 - 学会用 `ExpandableArrayBuffer` 应对未知大小消息；
 - 建立"零分配"思维：DirectBuffer + 复用 + 预分配。
 
+## 本章速览：Buffer 家族
+
+```mermaid
+classDiagram
+    class DirectBuffer {
+        <<interface>>
+        +getInt(offset)
+        +getLong(offset)
+        +getBytes(offset, dst)
+    }
+    class MutableDirectBuffer {
+        <<interface>>
+        +putInt(offset, value)
+        +putLong(offset, value)
+        +putBytes(offset, src)
+    }
+    class AtomicBuffer {
+        <<interface>>
+        +putIntOrdered
+        +compareAndSetInt
+    }
+    class UnsafeBuffer {
+        + heap 数组
+        + direct ByteBuffer
+        + 原生地址
+    }
+    class ExpandableArrayBuffer {
+        + 可自动扩容
+        + 慢路径用
+    }
+    DirectBuffer <|-- MutableDirectBuffer
+    MutableDirectBuffer <|-- AtomicBuffer
+    AtomicBuffer <|.. UnsafeBuffer
+    MutableDirectBuffer <|.. ExpandableArrayBuffer
+```
+
+**99% 场景**：直接用 `UnsafeBuffer(ByteBuffer.allocateDirect(N))`。
+
 ## 10.1 Agrona 是什么
 
 Agrona 是 Aeron 的姊妹项目，提供：
@@ -138,6 +176,23 @@ Aeron 内部大量用 `putIntOrdered` 做 producer/consumer 同步。
 - Heap：offer 时 driver 必须拷贝到 term buffer
 
 因此发送 buffer 必须 direct。接收 handler 里的 `DirectBuffer` 天然是 direct（term buffer 的一段），你可以直接读，或者 copy 出来到 heap。
+
+**数据流对比**：
+
+```mermaid
+flowchart LR
+    subgraph HEAP["heap 路径（多一次拷贝）"]
+        BH[业务对象] --> UBH["UnsafeBuffer<br/>on byte[]"]
+        UBH -->|memcpy| DIR1[Direct 中转]
+        DIR1 --> TB1[Term Buffer]
+    end
+    subgraph DIRECT["direct 路径（零拷贝）"]
+        BD[业务对象] --> UBD["UnsafeBuffer<br/>on DirectByteBuffer"]
+        UBD --> TB2[Term Buffer]
+    end
+    style HEAP fill:#fde8e8
+    style DIRECT fill:#caffbf
+```
 
 ## 10.9 测量：JMH 微基准
 

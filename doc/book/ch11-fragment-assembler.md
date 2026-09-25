@@ -7,6 +7,31 @@
 - 明白 `BEGIN` / `END` fragment flag 的机制；
 - 知道大消息在低延迟系统里的成本，学会规避。
 
+## 本章速览：3 KB 消息在 MTU=1408 下的路径
+
+```mermaid
+flowchart LR
+    subgraph P["Publisher offer 3KB"]
+        MSG[整条消息 3072 字节]
+    end
+    subgraph AERON[MediaDriver 自动拆片]
+        F1["Fragment 1<br/>1408 B<br/>flag=BEGIN"]
+        F2["Fragment 2<br/>1408 B<br/>flag=中间"]
+        F3["Fragment 3<br/>256 B<br/>flag=END"]
+    end
+    subgraph S["Subscriber 用 FragmentAssembler"]
+        BUF[重组 buffer]
+        FULL[完整消息 3072 字节]
+    end
+    MSG --> F1 & F2 & F3
+    F1 -->|存入| BUF
+    F2 -->|追加| BUF
+    F3 -->|追加+触发回调| FULL
+    style FULL fill:#caffbf
+```
+
+**关键**：Publisher 不感知拆片；只要 Subscriber 用了 `FragmentAssembler` 包装，业务 handler 收到的就是完整消息。
+
 ## 11.1 拆包的两条边界
 
 Aeron 会在两种情况把消息拆开：
@@ -26,6 +51,20 @@ Aeron header 里两个 bit 表示这个 fragment 在消息中的位置：
 | `BEGIN_FRAG_FLAG = 0x80` | 消息的第一片 |
 | `END_FRAG_FLAG = 0x40` | 消息的最后一片 |
 | `UNFRAGMENTED = 0xC0` | 完整消息（BEGIN + END 同时置位） |
+
+**flag 位可视化**：
+
+```
+       bit7  bit6
+        │     │
+     ┌──▼──┬──▼──┬─────────────┐
+     │BEGIN│ END │ 其他位保留   │
+     └─────┴─────┴─────────────┘
+        1     1   = 0xC0  完整消息（未拆）
+        1     0   = 0x80  第一片
+        0     0   = 0x00  中间片
+        0     1   = 0x40  最后一片
+```
 
 在 `FragmentHandler` 里你可以自己判：
 

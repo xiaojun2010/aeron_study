@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 06 章 · Subscription 与消费模型</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-light.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/index.min.js"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose" });
+</script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+                 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2em 1em 4em;
+    background: #fafafa;
+    color: #24292f;
+  }
+  .markdown-body {
+    background: #ffffff;
+    padding: 2.5em 3em;
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+  }
+  .markdown-body pre {
+    background: #f6f8fa !important;
+  }
+  .markdown-body pre.mermaid {
+    background: transparent !important;
+    text-align: center;
+    padding: 1em;
+  }
+  nav.chapter-nav {
+    display: flex;
+    justify-content: space-between;
+    padding: 1em;
+    margin-bottom: 1.5em;
+    background: #eef2f7;
+    border-radius: 8px;
+    font-size: 0.95em;
+  }
+  nav.chapter-nav a {
+    color: #0969da;
+    text-decoration: none;
+  }
+  nav.chapter-nav a:hover { text-decoration: underline; }
+  nav.chapter-nav .nav-link { min-width: 30%; }
+  nav.chapter-nav .nav-link.next { text-align: right; }
+  nav.chapter-nav .nav-link.home { text-align: center; }
+</style>
+</head>
+<body>
+<article class="markdown-body">
+<nav class="chapter-nav"><a href="ch05-publication.html" class="nav-link">← 第 05 章 · Publication 全解</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch07-channel-uri.html" class="nav-link next">第 07 章 · Channel URI 完全指南 →</a></nav>
+<h1 id="06-subscription">第 06 章 · Subscription 与消费模型</h1>
+<h2 id="_1">学习目标</h2>
+<ul>
+<li>弄清 <code>Subscription</code>, <code>Image</code>, <code>FragmentHandler</code>, <code>ControlledFragmentHandler</code> 的关系；</li>
+<li>掌握 <code>poll</code> / <code>controlledPoll</code> / <code>blockPoll</code> 三种消费方式；</li>
+<li>学会用 <code>Image.position</code> 和 <code>boundedPoll</code> 做"回压 / 限速"；</li>
+<li>明白多个 Publisher 打进同一 Subscription 时的语义。</li>
+</ul>
+<h2 id="_2">本章速览</h2>
+<pre class="mermaid">
+flowchart LR
+    subgraph SUB[Subscription]
+        I1[Image<br/>sessionId=A]
+        I2[Image<br/>sessionId=B]
+        I3[Image<br/>sessionId=C]
+    end
+    PA[Publisher A] -->|stream=42| I1
+    PB[Publisher B] -->|stream=42| I2
+    PC[Publisher C] -->|stream=42| I3
+    SUB --> H[FragmentHandler]
+    H --> APP[业务对象]
+    style SUB fill:#fef3c7
+    style H fill:#caffbf
+</pre>
+
+<p><strong>记忆</strong>：一个 Subscription = 多个 Image 的聚合；每个 Publisher 会话在收方就是一个 Image。</p>
+<h2 id="61-subscription-image">6.1 Subscription 是"多 Image 的聚合"</h2>
+<div class="codehilite"><pre><span></span><code>Publisher A (sessionId=0x1a) ──┐
+                               │
+Publisher B (sessionId=0x2b) ──┼──▶ Subscription (channel=&quot;aeron:ipc&quot;, streamId=42)
+                               │
+Publisher C (sessionId=0x3c) ──┘
+
+Subscription.images() = [ImageA, ImageB, ImageC]
+</code></pre></div>
+
+<ul>
+<li>每个 Publisher → 一个 sessionId → 在 Subscription 侧变成一个 Image；</li>
+<li>Image 是"某个会话的收方镜像"，各自有独立的 position / term buffer；</li>
+<li><code>Subscription.poll()</code> 会轮询它拥有的所有 Image。</li>
+</ul>
+<h2 id="62-poll">6.2 poll 的三种口味</h2>
+<pre class="mermaid">
+flowchart TD
+    START([每轮 poll 开始]) --> Q{选哪种 poll}
+    Q -->|简单消费| A[poll<br/>回调每个 fragment]
+    Q -->|需要回压/暂停| B[controlledPoll<br/>回调返回 Action]
+    Q -->|按连续字节| C[blockPoll<br/>不关心 fragment 边界]
+
+    A --> A1[handler 无返回值]
+    B --> B1{Action?}
+    B1 --> CONT[CONTINUE 继续]
+    B1 --> BREAK[BREAK 停止, 下次跳过本条]
+    B1 --> ABORT[ABORT 停止, 下次重来]
+    B1 --> COMMIT[COMMIT 提交继续]
+    C --> C1[通常用于 Archive/落盘]
+
+    style A fill:#caffbf
+    style B fill:#fdffb6
+    style C fill:#a0c4ff
+</pre>
+
+<div class="codehilite"><pre><span></span><code><span class="c1">// 1) 最常用：每个 fragment 都回调</span>
+<span class="kt">int</span><span class="w"> </span><span class="nf">poll</span><span class="p">(</span><span class="n">FragmentHandler</span><span class="w"> </span><span class="n">handler</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">fragmentLimit</span><span class="p">);</span>
+
+<span class="c1">// 2) 允许 handler 返回 Action 控制流程</span>
+<span class="kt">int</span><span class="w"> </span><span class="nf">controlledPoll</span><span class="p">(</span><span class="n">ControlledFragmentHandler</span><span class="w"> </span><span class="n">handler</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">fragmentLimit</span><span class="p">);</span>
+
+<span class="c1">// 3) 阻塞式：一次拿一片连续内存（不是完整消息，只是连续字节）</span>
+<span class="kt">int</span><span class="w"> </span><span class="nf">blockPoll</span><span class="p">(</span><span class="n">BlockHandler</span><span class="w"> </span><span class="n">handler</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">blockLengthLimit</span><span class="p">);</span>
+</code></pre></div>
+
+<h3 id="621-fragmenthandler">6.2.1 FragmentHandler（普通）</h3>
+<div class="codehilite"><pre><span></span><code><span class="n">FragmentHandler</span><span class="w"> </span><span class="n">handler</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">buffer</span><span class="p">,</span><span class="w"> </span><span class="n">offset</span><span class="p">,</span><span class="w"> </span><span class="n">length</span><span class="p">,</span><span class="w"> </span><span class="n">header</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">long</span><span class="w"> </span><span class="n">pos</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">header</span><span class="p">.</span><span class="na">position</span><span class="p">();</span>
+<span class="w">    </span><span class="c1">// 处理 length 字节</span>
+<span class="p">};</span>
+</code></pre></div>
+
+<h3 id="622-controlledfragmenthandler">6.2.2 ControlledFragmentHandler</h3>
+<p>回调可以返回四种 Action：</p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>CONTINUE</code></td>
+<td>处理完，继续下一条</td>
+</tr>
+<tr>
+<td><code>BREAK</code></td>
+<td>立即停止本次 poll，下次 poll 从<strong>这条之后</strong>开始</td>
+</tr>
+<tr>
+<td><code>ABORT</code></td>
+<td>立即停止，下次 poll 从<strong>这条</strong>重新开始（等于"这条没消费"）</td>
+</tr>
+<tr>
+<td><code>COMMIT</code></td>
+<td>提交到目前为止的所有消费，然后继续（一般拼装大消息时用）</td>
+</tr>
+</tbody>
+</table>
+<p>举例："下游队列满就先停下"：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">ControlledFragmentHandler</span><span class="w"> </span><span class="n">h</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">buffer</span><span class="p">,</span><span class="w"> </span><span class="n">offset</span><span class="p">,</span><span class="w"> </span><span class="n">length</span><span class="p">,</span><span class="w"> </span><span class="n">header</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">downstream</span><span class="p">.</span><span class="na">isFull</span><span class="p">())</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="n">Action</span><span class="p">.</span><span class="na">ABORT</span><span class="p">;</span><span class="w">    </span><span class="c1">// 不消费</span>
+<span class="w">    </span><span class="n">downstream</span><span class="p">.</span><span class="na">enqueue</span><span class="p">(</span><span class="n">buffer</span><span class="p">,</span><span class="w"> </span><span class="n">offset</span><span class="p">,</span><span class="w"> </span><span class="n">length</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">Action</span><span class="p">.</span><span class="na">CONTINUE</span><span class="p">;</span>
+<span class="p">};</span>
+<span class="n">subscription</span><span class="p">.</span><span class="na">controlledPoll</span><span class="p">(</span><span class="n">h</span><span class="p">,</span><span class="w"> </span><span class="mi">10</span><span class="p">);</span>
+</code></pre></div>
+
+<h3 id="623-blockhandler">6.2.3 BlockHandler</h3>
+<p>给"我不关心 fragment 边界，只想拿到连续字节"的场景（比如 Archive 的 recording）：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">BlockHandler</span><span class="w"> </span><span class="n">bh</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">buffer</span><span class="p">,</span><span class="w"> </span><span class="n">offset</span><span class="p">,</span><span class="w"> </span><span class="n">length</span><span class="p">,</span><span class="w"> </span><span class="n">sessionId</span><span class="p">,</span><span class="w"> </span><span class="n">termId</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// length 是本次连续读到的字节数，可能包含多条 fragment</span>
+<span class="w">    </span><span class="n">file</span><span class="p">.</span><span class="na">write</span><span class="p">(</span><span class="n">buffer</span><span class="p">,</span><span class="w"> </span><span class="n">offset</span><span class="p">,</span><span class="w"> </span><span class="n">length</span><span class="p">);</span>
+<span class="p">};</span>
+<span class="n">subscription</span><span class="p">.</span><span class="na">blockPoll</span><span class="p">(</span><span class="n">bh</span><span class="p">,</span><span class="w"> </span><span class="mi">4096</span><span class="p">);</span>
+</code></pre></div>
+
+<h2 id="63-fragmentlimit">6.3 fragmentLimit 的含义</h2>
+<p><code>poll(handler, limit)</code> 里的 limit 是"本次调用最多回调多少个 fragment"，用来控制单次 poll 的耗时上限（避免一直卡在 poll 里）。生产上常见值：</p>
+<ul>
+<li>交易/延迟敏感：<code>10 ~ 50</code></li>
+<li>吞吐优先：<code>100 ~ 500</code></li>
+</ul>
+<h2 id="64-subscription-poll">6.4 多路 Subscription 的 poll 循环</h2>
+<p>真实系统一般有多路数据，一个线程 poll 多个 Subscription 是常见做法：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">IdleStrategy</span><span class="w"> </span><span class="n">idle</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">BackoffIdleStrategy</span><span class="p">(...);</span>
+<span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="n">running</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">total</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="n">total</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">subMarket</span><span class="p">.</span><span class="na">poll</span><span class="p">(</span><span class="n">marketHandler</span><span class="p">,</span><span class="w"> </span><span class="mi">20</span><span class="p">);</span>
+<span class="w">    </span><span class="n">total</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">subOrder</span><span class="p">.</span><span class="na">poll</span><span class="p">(</span><span class="n">orderHandler</span><span class="p">,</span><span class="w">   </span><span class="mi">20</span><span class="p">);</span>
+<span class="w">    </span><span class="n">total</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">subFill</span><span class="p">.</span><span class="na">poll</span><span class="p">(</span><span class="n">fillHandler</span><span class="p">,</span><span class="w">    </span><span class="mi">20</span><span class="p">);</span>
+<span class="w">    </span><span class="n">idle</span><span class="p">.</span><span class="na">idle</span><span class="p">(</span><span class="n">total</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>如果你有很多 Subscription，Aeron 提供 <code>Aeron.addSubscription(...)</code> 之外的 helper：<code>SubscriptionUtil.pollAll(...)</code>（自己实现就行）。</p>
+<h2 id="65">6.5 广播语义再确认</h2>
+<p>一次消息经过 <code>pub.offer()</code>：</p>
+<div class="codehilite"><pre><span></span><code>             ┌─▶ Subscription 1 (poll)  ← 收到
+Publication ─┼─▶ Subscription 2 (poll)  ← 收到
+             └─▶ Subscription 3 (poll)  ← 收到
+</code></pre></div>
+
+<p><strong>所有</strong> 订阅同一 (channel, streamId) 的 Subscription 都会收到 <strong>全量</strong>。
+如果要分片给一群 worker，业务层要自己做（sessionId % workerCount，或者干脆用不同 stream）。</p>
+<h2 id="66-subscription-image">6.6 Subscription 与 Image 事件</h2>
+<p>有时候你想知道"某个 Publisher 断开了"或者"新来了一个 Publisher"，可以通过 availability handler：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">Aeron</span><span class="p">.</span><span class="na">Context</span><span class="w"> </span><span class="n">aeronCtx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">Aeron</span><span class="p">.</span><span class="na">Context</span><span class="p">()</span>
+<span class="w">    </span><span class="p">.</span><span class="na">aeronDirectoryName</span><span class="p">(</span><span class="n">driver</span><span class="p">.</span><span class="na">aeronDirectoryName</span><span class="p">())</span>
+<span class="w">    </span><span class="p">.</span><span class="na">availableImageHandler</span><span class="p">(</span><span class="n">image</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">log</span><span class="p">.</span><span class="na">info</span><span class="p">(</span><span class="s">&quot;新 Image 上线, sessionId={}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">image</span><span class="p">.</span><span class="na">sessionId</span><span class="p">()))</span>
+<span class="w">    </span><span class="p">.</span><span class="na">unavailableImageHandler</span><span class="p">(</span><span class="n">image</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">log</span><span class="p">.</span><span class="na">info</span><span class="p">(</span><span class="s">&quot;Image 下线, sessionId={}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">image</span><span class="p">.</span><span class="na">sessionId</span><span class="p">()));</span>
+
+<span class="n">Aeron</span><span class="w"> </span><span class="n">aeron</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Aeron</span><span class="p">.</span><span class="na">connect</span><span class="p">(</span><span class="n">aeronCtx</span><span class="p">);</span>
+</code></pre></div>
+
+<p>或者按 Subscription 单独设：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">aeron</span><span class="p">.</span><span class="na">addSubscription</span><span class="p">(</span>
+<span class="w">    </span><span class="n">channel</span><span class="p">,</span><span class="w"> </span><span class="n">streamId</span><span class="p">,</span>
+<span class="w">    </span><span class="n">availableImageHandler</span><span class="p">,</span><span class="w"> </span><span class="n">unavailableImageHandler</span><span class="p">);</span>
+</code></pre></div>
+
+<h2 id="67">6.7 一段"限速消费"的示例</h2>
+<p>想让某个下游只吃 100 msg/s：</p>
+<div class="codehilite"><pre><span></span><code><span class="kt">long</span><span class="w"> </span><span class="n">rate</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">100</span><span class="p">;</span>
+<span class="kt">long</span><span class="w"> </span><span class="n">start</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">System</span><span class="p">.</span><span class="na">nanoTime</span><span class="p">();</span>
+<span class="kt">long</span><span class="w"> </span><span class="n">consumed</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+
+<span class="n">ControlledFragmentHandler</span><span class="w"> </span><span class="n">h</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">buffer</span><span class="p">,</span><span class="w"> </span><span class="n">offset</span><span class="p">,</span><span class="w"> </span><span class="n">length</span><span class="p">,</span><span class="w"> </span><span class="n">header</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">long</span><span class="w"> </span><span class="n">expected</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">System</span><span class="p">.</span><span class="na">nanoTime</span><span class="p">()</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">start</span><span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">rate</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">1_000_000_000L</span><span class="p">;</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">consumed</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="n">expected</span><span class="p">)</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="n">Action</span><span class="p">.</span><span class="na">ABORT</span><span class="p">;</span><span class="w">  </span><span class="c1">// 太快了，先歇</span>
+<span class="w">    </span><span class="n">consumed</span><span class="o">++</span><span class="p">;</span>
+<span class="w">    </span><span class="c1">// 真正业务逻辑</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">Action</span><span class="p">.</span><span class="na">CONTINUE</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="n">running</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">subscription</span><span class="p">.</span><span class="na">controlledPoll</span><span class="p">(</span><span class="n">h</span><span class="p">,</span><span class="w"> </span><span class="mi">10</span><span class="p">);</span>
+<span class="w">    </span><span class="n">LockSupport</span><span class="p">.</span><span class="na">parkNanos</span><span class="p">(</span><span class="mi">100_000</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h2 id="68-close">6.8 close 与资源</h2>
+<ul>
+<li><code>Subscription.close()</code> 会释放所有 Image 与 term buffer 引用；</li>
+<li><code>Aeron</code> 是所有 Sub/Pub 的父容器，<code>aeron.close()</code> 会依次关闭下辖对象；</li>
+<li>建议 try-with-resources，避免文件 handle 泄漏。</li>
+</ul>
+<h2 id="69">6.9 小结</h2>
+<ul>
+<li>Subscription 是聚合，Image 是"每个会话的镜像"；</li>
+<li><code>poll</code> + <code>fragmentLimit</code> 是消费主循环的核心节奏；</li>
+<li><code>controlledPoll</code> + <code>Action</code> 让你在业务层做精确回压。</li>
+</ul>
+<nav class="chapter-nav"><a href="ch05-publication.html" class="nav-link">← 第 05 章 · Publication 全解</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch07-channel-uri.html" class="nav-link next">第 07 章 · Channel URI 完全指南 →</a></nav>
+</article>
+<script>
+  // 高亮所有非 mermaid 代码块
+  document.querySelectorAll('pre code:not(.language-mermaid)').forEach(el => {
+    if (window.hljs) hljs.highlightElement(el);
+  });
+</script>
+</body>
+</html>

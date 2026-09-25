@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 12 章 · Simple Binary Encoding（SBE）</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-light.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github.min.css">
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/index.min.js"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose" });
+</script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+                 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2em 1em 4em;
+    background: #fafafa;
+    color: #24292f;
+  }
+  .markdown-body {
+    background: #ffffff;
+    padding: 2.5em 3em;
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+  }
+  .markdown-body pre {
+    background: #f6f8fa !important;
+  }
+  .markdown-body pre.mermaid {
+    background: transparent !important;
+    text-align: center;
+    padding: 1em;
+  }
+  nav.chapter-nav {
+    display: flex;
+    justify-content: space-between;
+    padding: 1em;
+    margin-bottom: 1.5em;
+    background: #eef2f7;
+    border-radius: 8px;
+    font-size: 0.95em;
+  }
+  nav.chapter-nav a {
+    color: #0969da;
+    text-decoration: none;
+  }
+  nav.chapter-nav a:hover { text-decoration: underline; }
+  nav.chapter-nav .nav-link { min-width: 30%; }
+  nav.chapter-nav .nav-link.next { text-align: right; }
+  nav.chapter-nav .nav-link.home { text-align: center; }
+</style>
+</head>
+<body>
+<article class="markdown-body">
+<nav class="chapter-nav"><a href="ch11-fragment-assembler.html" class="nav-link">← 第 11 章 · 大消息与 FragmentAssembler</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch13-image-term.html" class="nav-link next">第 13 章 · Image / Session / Term Buffer →</a></nav>
+<h1 id="12-simple-binary-encodingsbe">第 12 章 · Simple Binary Encoding（SBE）</h1>
+<h2 id="_1">学习目标</h2>
+<ul>
+<li>明白 SBE 适合什么、不适合什么；</li>
+<li>能写一个 SBE schema XML 并生成 Java；</li>
+<li>学会用 SBE + <code>tryClaim</code> 做零拷贝 encoding；</li>
+<li>认识 SBE 与 Aeron 生态的深度绑定。</li>
+</ul>
+<h2 id="sbe-aeron">本章速览：SBE + Aeron 的黄金路径</h2>
+<pre class="mermaid">
+flowchart LR
+    XML[SBE schema<br/>XML] -->|sbe-tool 生成| CODE[Encoder/Decoder<br/>Java 类]
+    subgraph SEND["发送端（零拷贝）"]
+        BUS1[业务字段] --> ENC[Encoder]
+        CLAIM[tryClaim 拿到<br/>term buffer 一段] --> ENC
+        ENC -->|直接写到 term buffer| CMT[commit]
+    end
+    subgraph RECV["接收端（零拷贝）"]
+        FRAG[fragment 到达] --> DEC[Decoder wrap]
+        DEC --> HDR[templateId 分发]
+        HDR --> BUS2[业务字段]
+    end
+    CODE -.-> ENC
+    CODE -.-> DEC
+    style ENC fill:#caffbf
+    style DEC fill:#caffbf
+    style CLAIM fill:#a0c4ff
+</pre>
+
+<p><strong>记忆</strong>：<code>schema XML → 生成代码 → tryClaim + encoder → 直接写 term buffer → decoder wrap → 直接读字段</code>，全程零 object 分配。</p>
+<h2 id="121-sbe">12.1 SBE 是什么</h2>
+<p>Simple Binary Encoding 是 FIX 协会牵头的二进制编码标准，Aeron 作者 Martin Thompson 也是核心贡献者。特点：</p>
+<ul>
+<li><strong>零 GC</strong>：生成的 encoder/decoder 全部基于 DirectBuffer；</li>
+<li><strong>固定布局</strong>：offset 在编译期确定，读写一条 field 一次内存访问；</li>
+<li><strong>可扩展</strong>：向后兼容（加字段用 sinceVersion）；</li>
+<li><strong>schema-first</strong>：XML 描述消息，生成代码。</li>
+</ul>
+<h2 id="122-protobuf-avro">12.2 与 protobuf / Avro 的差别</h2>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>SBE</th>
+<th>protobuf</th>
+<th>Avro</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>布局</td>
+<td>固定偏移</td>
+<td>tag + varint</td>
+<td>schema resolution</td>
+</tr>
+<tr>
+<td>GC</td>
+<td>零</td>
+<td>有对象分配</td>
+<td>有</td>
+</tr>
+<tr>
+<td>兼容性</td>
+<td>语义扩展（加字段/枚举）</td>
+<td>强兼容</td>
+<td>强兼容</td>
+</tr>
+<tr>
+<td>schema 分发</td>
+<td>编译期</td>
+<td>编译期</td>
+<td>运行时可选</td>
+</tr>
+<tr>
+<td>适合</td>
+<td>高频交易、行情</td>
+<td>通用 RPC</td>
+<td>大数据管道</td>
+</tr>
+</tbody>
+</table>
+<h2 id="123-schema">12.3 一份 schema 示例</h2>
+<p><code>market-data.xml</code>：</p>
+<div class="codehilite"><pre><span></span><code><span class="cp">&lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;</span>
+<span class="nt">&lt;sbe:messageSchema</span><span class="w"> </span><span class="na">xmlns:sbe=</span><span class="s">&quot;http://fixprotocol.io/2016/sbe&quot;</span>
+<span class="w">    </span><span class="na">package=</span><span class="s">&quot;org.example.sbe&quot;</span><span class="w"> </span><span class="na">id=</span><span class="s">&quot;1&quot;</span><span class="w"> </span><span class="na">version=</span><span class="s">&quot;0&quot;</span><span class="w"> </span><span class="na">byteOrder=</span><span class="s">&quot;littleEndian&quot;</span><span class="nt">&gt;</span>
+
+<span class="w">    </span><span class="nt">&lt;types&gt;</span>
+<span class="w">        </span><span class="nt">&lt;composite</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;messageHeader&quot;</span><span class="nt">&gt;</span>
+<span class="w">            </span><span class="nt">&lt;type</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;blockLength&quot;</span><span class="w"> </span><span class="na">primitiveType=</span><span class="s">&quot;uint16&quot;</span><span class="nt">/&gt;</span>
+<span class="w">            </span><span class="nt">&lt;type</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;templateId&quot;</span><span class="w">  </span><span class="na">primitiveType=</span><span class="s">&quot;uint16&quot;</span><span class="nt">/&gt;</span>
+<span class="w">            </span><span class="nt">&lt;type</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;schemaId&quot;</span><span class="w">    </span><span class="na">primitiveType=</span><span class="s">&quot;uint16&quot;</span><span class="nt">/&gt;</span>
+<span class="w">            </span><span class="nt">&lt;type</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;version&quot;</span><span class="w">     </span><span class="na">primitiveType=</span><span class="s">&quot;uint16&quot;</span><span class="nt">/&gt;</span>
+<span class="w">        </span><span class="nt">&lt;/composite&gt;</span>
+<span class="w">        </span><span class="nt">&lt;type</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;Price&quot;</span><span class="w"> </span><span class="na">primitiveType=</span><span class="s">&quot;int64&quot;</span><span class="w"> </span><span class="na">description=</span><span class="s">&quot;8 decimal fixed point&quot;</span><span class="nt">/&gt;</span>
+<span class="w">    </span><span class="nt">&lt;/types&gt;</span>
+
+<span class="w">    </span><span class="nt">&lt;sbe:message</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;MarketTick&quot;</span><span class="w"> </span><span class="na">id=</span><span class="s">&quot;100&quot;</span><span class="w"> </span><span class="na">description=</span><span class="s">&quot;行情 tick&quot;</span><span class="nt">&gt;</span>
+<span class="w">        </span><span class="nt">&lt;field</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;timestamp&quot;</span><span class="w">  </span><span class="na">id=</span><span class="s">&quot;1&quot;</span><span class="w"> </span><span class="na">type=</span><span class="s">&quot;int64&quot;</span><span class="nt">/&gt;</span>
+<span class="w">        </span><span class="nt">&lt;field</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;symbolId&quot;</span><span class="w">   </span><span class="na">id=</span><span class="s">&quot;2&quot;</span><span class="w"> </span><span class="na">type=</span><span class="s">&quot;int32&quot;</span><span class="nt">/&gt;</span>
+<span class="w">        </span><span class="nt">&lt;field</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;bidPrice&quot;</span><span class="w">   </span><span class="na">id=</span><span class="s">&quot;3&quot;</span><span class="w"> </span><span class="na">type=</span><span class="s">&quot;Price&quot;</span><span class="nt">/&gt;</span>
+<span class="w">        </span><span class="nt">&lt;field</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;askPrice&quot;</span><span class="w">   </span><span class="na">id=</span><span class="s">&quot;4&quot;</span><span class="w"> </span><span class="na">type=</span><span class="s">&quot;Price&quot;</span><span class="nt">/&gt;</span>
+<span class="w">        </span><span class="nt">&lt;field</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;bidSize&quot;</span><span class="w">    </span><span class="na">id=</span><span class="s">&quot;5&quot;</span><span class="w"> </span><span class="na">type=</span><span class="s">&quot;int32&quot;</span><span class="nt">/&gt;</span>
+<span class="w">        </span><span class="nt">&lt;field</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;askSize&quot;</span><span class="w">    </span><span class="na">id=</span><span class="s">&quot;6&quot;</span><span class="w"> </span><span class="na">type=</span><span class="s">&quot;int32&quot;</span><span class="nt">/&gt;</span>
+<span class="w">    </span><span class="nt">&lt;/sbe:message&gt;</span>
+<span class="nt">&lt;/sbe:messageSchema&gt;</span>
+</code></pre></div>
+
+<h2 id="124">12.4 代码生成</h2>
+<p>用 SBE 官方 jar：</p>
+<div class="codehilite"><pre><span></span><code>java<span class="w"> </span>-jar<span class="w"> </span>sbe-all-1.31.1.jar<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-Dsbe.output.dir<span class="o">=</span>src/main/java<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-Dsbe.target.language<span class="o">=</span>Java<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>market-data.xml
+</code></pre></div>
+
+<p>生成 <code>MarketTickEncoder.java</code> / <code>MarketTickDecoder.java</code> / <code>MessageHeaderEncoder.java</code> 等。
+Maven 插件版本：<code>uk.co.real-logic:sbe-tool</code>。</p>
+<h2 id="125-encoder-aeron-tryclaim">12.5 encoder + Aeron tryClaim（零拷贝黄金组合）</h2>
+<div class="codehilite"><pre><span></span><code><span class="kd">private</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="n">ExclusivePublication</span><span class="w"> </span><span class="n">pub</span><span class="p">;</span>
+<span class="kd">private</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="n">BufferClaim</span><span class="w"> </span><span class="n">claim</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">BufferClaim</span><span class="p">();</span>
+<span class="kd">private</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="n">MessageHeaderEncoder</span><span class="w"> </span><span class="n">header</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">MessageHeaderEncoder</span><span class="p">();</span>
+<span class="kd">private</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="n">MarketTickEncoder</span><span class="w">    </span><span class="n">encoder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">MarketTickEncoder</span><span class="p">();</span>
+
+<span class="kd">public</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">publishTick</span><span class="p">(</span><span class="kt">long</span><span class="w"> </span><span class="n">ts</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">symbolId</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">bid</span><span class="p">,</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">ask</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">bidSz</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">askSz</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">length</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">MessageHeaderEncoder</span><span class="p">.</span><span class="na">ENCODED_LENGTH</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">MarketTickEncoder</span><span class="p">.</span><span class="na">BLOCK_LENGTH</span><span class="p">;</span>
+
+<span class="w">    </span><span class="kt">long</span><span class="w"> </span><span class="n">r</span><span class="p">;</span>
+<span class="w">    </span><span class="k">while</span><span class="w"> </span><span class="p">((</span><span class="n">r</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">pub</span><span class="p">.</span><span class="na">tryClaim</span><span class="p">(</span><span class="n">length</span><span class="p">,</span><span class="w"> </span><span class="n">claim</span><span class="p">))</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 处理 offer 返回值</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="n">encoder</span><span class="p">.</span><span class="na">wrapAndApplyHeader</span><span class="p">(</span><span class="n">claim</span><span class="p">.</span><span class="na">buffer</span><span class="p">(),</span><span class="w"> </span><span class="n">claim</span><span class="p">.</span><span class="na">offset</span><span class="p">(),</span><span class="w"> </span><span class="n">header</span><span class="p">)</span>
+<span class="w">           </span><span class="p">.</span><span class="na">timestamp</span><span class="p">(</span><span class="n">ts</span><span class="p">)</span>
+<span class="w">           </span><span class="p">.</span><span class="na">symbolId</span><span class="p">(</span><span class="n">symbolId</span><span class="p">)</span>
+<span class="w">           </span><span class="p">.</span><span class="na">bidPrice</span><span class="p">(</span><span class="n">bid</span><span class="p">)</span>
+<span class="w">           </span><span class="p">.</span><span class="na">askPrice</span><span class="p">(</span><span class="n">ask</span><span class="p">)</span>
+<span class="w">           </span><span class="p">.</span><span class="na">bidSize</span><span class="p">(</span><span class="n">bidSz</span><span class="p">)</span>
+<span class="w">           </span><span class="p">.</span><span class="na">askSize</span><span class="p">(</span><span class="n">askSz</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">claim</span><span class="p">.</span><span class="na">commit</span><span class="p">();</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>零拷贝路径：
+- 业务字段直接写到 term buffer；
+- 无中间 <code>byte[]</code>；
+- 无 String / Object 分配。</p>
+<h2 id="126-decoder-fragmenthandler">12.6 decoder + FragmentHandler</h2>
+<div class="codehilite"><pre><span></span><code><span class="kd">private</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="n">MessageHeaderDecoder</span><span class="w"> </span><span class="n">header</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">MessageHeaderDecoder</span><span class="p">();</span>
+<span class="kd">private</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="n">MarketTickDecoder</span><span class="w">    </span><span class="n">decoder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">MarketTickDecoder</span><span class="p">();</span>
+
+<span class="n">FragmentHandler</span><span class="w"> </span><span class="n">h</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">buffer</span><span class="p">,</span><span class="w"> </span><span class="n">offset</span><span class="p">,</span><span class="w"> </span><span class="n">length</span><span class="p">,</span><span class="w"> </span><span class="n">hdr</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">header</span><span class="p">.</span><span class="na">wrap</span><span class="p">(</span><span class="n">buffer</span><span class="p">,</span><span class="w"> </span><span class="n">offset</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">header</span><span class="p">.</span><span class="na">templateId</span><span class="p">()</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="n">MarketTickDecoder</span><span class="p">.</span><span class="na">TEMPLATE_ID</span><span class="p">)</span><span class="w"> </span><span class="k">return</span><span class="p">;</span>
+
+<span class="w">    </span><span class="n">decoder</span><span class="p">.</span><span class="na">wrap</span><span class="p">(</span>
+<span class="w">        </span><span class="n">buffer</span><span class="p">,</span>
+<span class="w">        </span><span class="n">offset</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">MessageHeaderDecoder</span><span class="p">.</span><span class="na">ENCODED_LENGTH</span><span class="p">,</span>
+<span class="w">        </span><span class="n">header</span><span class="p">.</span><span class="na">blockLength</span><span class="p">(),</span>
+<span class="w">        </span><span class="n">header</span><span class="p">.</span><span class="na">version</span><span class="p">());</span>
+
+<span class="w">    </span><span class="kt">long</span><span class="w"> </span><span class="n">ts</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">decoder</span><span class="p">.</span><span class="na">timestamp</span><span class="p">();</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">sid</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">decoder</span><span class="p">.</span><span class="na">symbolId</span><span class="p">();</span>
+<span class="w">    </span><span class="kt">long</span><span class="w"> </span><span class="n">bid</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">decoder</span><span class="p">.</span><span class="na">bidPrice</span><span class="p">();</span>
+<span class="w">    </span><span class="c1">// ...</span>
+<span class="p">};</span>
+</code></pre></div>
+
+<h2 id="127-sbe">12.7 SBE 的进阶特性</h2>
+<ul>
+<li><strong>group</strong>：可变长的重复子结构（用于订单簿深度）</li>
+<li><strong>varData</strong>：变长字段（symbol 字符串、消息 payload）</li>
+<li><strong>enum / bitset / composite</strong>：结构化类型</li>
+<li><strong>presence</strong>：required / optional / constant</li>
+<li><strong>sinceVersion</strong>：向后兼容加字段</li>
+</ul>
+<h2 id="128-dispatch">12.8 消息 dispatch</h2>
+<p>一个 stream 上可能有多种 SBE message，用 <code>templateId</code> 分发：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">switch</span><span class="w"> </span><span class="p">(</span><span class="n">header</span><span class="p">.</span><span class="na">templateId</span><span class="p">())</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">case</span><span class="w"> </span><span class="n">MarketTickDecoder</span><span class="p">.</span><span class="na">TEMPLATE_ID</span><span class="p">:</span><span class="w"> </span><span class="n">handleTick</span><span class="p">(...);</span><span class="w"> </span><span class="k">break</span><span class="p">;</span>
+<span class="w">    </span><span class="k">case</span><span class="w"> </span><span class="n">OrderDecoder</span><span class="p">.</span><span class="na">TEMPLATE_ID</span><span class="p">:</span><span class="w">      </span><span class="n">handleOrder</span><span class="p">(...);</span><span class="w"> </span><span class="k">break</span><span class="p">;</span>
+<span class="w">    </span><span class="k">case</span><span class="w"> </span><span class="n">FillDecoder</span><span class="p">.</span><span class="na">TEMPLATE_ID</span><span class="p">:</span><span class="w">       </span><span class="n">handleFill</span><span class="p">(...);</span><span class="w"> </span><span class="k">break</span><span class="p">;</span>
+<span class="w">    </span><span class="k">default</span><span class="p">:</span><span class="w"> </span><span class="n">log</span><span class="p">.</span><span class="na">warn</span><span class="p">(</span><span class="s">&quot;未知 templateId={}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">header</span><span class="p">.</span><span class="na">templateId</span><span class="p">());</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h2 id="129-sbe-message">12.9 SBE message 布局示意</h2>
+<p>以第 12.3 节的 MarketTick 为例，在 buffer 里的字节布局：</p>
+<div class="codehilite"><pre><span></span><code>偏移: 0         8              12          20         28         36     40
+     ┌─────────┬──────────────┬────────────┬──────────┬──────────┬──────┬────
+     │Header 8B│ timestamp    │ symbolId   │ bidPrice │ askPrice │ bidSz│...
+     │         │   int64      │   int32    │  int64   │  int64   │ int32│
+     └─────────┴──────────────┴────────────┴──────────┴──────────┴──────┴────
+       ▲             ▲                                                   ▲
+       │             │                                                   │
+   blockLen        字段 1                                             blockLength
+   templateId
+   schemaId
+   version
+</code></pre></div>
+
+<p><strong>优点</strong>：
+- 每个字段偏移固定 → 一次内存访问
+- 无 tag/varint → 无解析开销
+- 字段读写像访问结构体 field</p>
+<h2 id="1210-sbe-aeron">12.10 SBE 在 Aeron 生态</h2>
+<ul>
+<li><strong>Aeron Cluster</strong>：内部所有 protocol message（session connect / vote / append）都是 SBE</li>
+<li><strong>Aeron Archive</strong>：Control protocol 全是 SBE</li>
+<li><strong>aeron-cookbook</strong>：几乎所有 sample 都用 SBE</li>
+</ul>
+<p>因此 SBE 不是"可选加分项"，而是"深入 Aeron 必学"。</p>
+<h2 id="1211">12.11 常见陷阱</h2>
+<ol>
+<li><strong>忘记写 header</strong>：encoder.wrap 不带 header，decoder 就找不到 templateId。</li>
+<li><strong>不 commit 直接返回</strong>：tryClaim 后必须 commit / abort。</li>
+<li><strong>decoder wrap 用错 blockLength</strong>：跨版本时用 <code>header.blockLength()</code> 而不是常量。</li>
+<li><strong>varData / group 计算 length</strong>：整体消息长度 = header + block + group + varData，不要固定长度。</li>
+</ol>
+<h2 id="1212">12.12 小结</h2>
+<ul>
+<li>SBE = 零 GC 的二进制协议</li>
+<li>SBE + tryClaim + ExclusivePublication = Aeron 生态最快的发送路径</li>
+<li>Cluster / Archive 都强制用 SBE，早学早受益</li>
+</ul>
+<nav class="chapter-nav"><a href="ch11-fragment-assembler.html" class="nav-link">← 第 11 章 · 大消息与 FragmentAssembler</a><a href="index.html" class="nav-link home">📖 目录</a><a href="ch13-image-term.html" class="nav-link next">第 13 章 · Image / Session / Term Buffer →</a></nav>
+</article>
+<script>
+  // 高亮所有非 mermaid 代码块
+  document.querySelectorAll('pre code:not(.language-mermaid)').forEach(el => {
+    if (window.hljs) hljs.highlightElement(el);
+  });
+</script>
+</body>
+</html>

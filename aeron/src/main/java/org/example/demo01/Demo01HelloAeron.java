@@ -79,6 +79,8 @@ public class Demo01HelloAeron {
              // 与 Publication 使用完全相同的 CHANNEL + STREAM_ID，才能收到对方消息。
              Subscription subscription = aeron.addSubscription(CHANNEL, STREAM_ID)) {
 
+            log.info("mediaDriver.aeronDirectoryName() = {}",mediaDriver.aeronDirectoryName());
+
             // -------------------------------------------------------------------
             // Step 5. 等待 Publication / Subscription "连接完成"
             // -------------------------------------------------------------------
@@ -108,7 +110,7 @@ public class Demo01HelloAeron {
             FragmentHandler fragmentHandler = (dirBuf, offset, length, header) -> {
                 byte[] data = new byte[length];
                 dirBuf.getBytes(offset, data);
-                log.info("[Subscriber] 收到消息：{}", new String(data, StandardCharsets.UTF_8));
+                log.info("sessionId = {}, [Subscriber] 收到消息：{}",header.sessionId(), new String(data, StandardCharsets.UTF_8));
             };
 
             // -------------------------------------------------------------------
@@ -133,6 +135,7 @@ public class Demo01HelloAeron {
                 // Demo01 只做最简单的重试，遇到负值就 yield 一下再试。
                 long result;
                 while ((result = publication.offer(buffer, 0, bytes.length)) < 0) {
+                    log.info("[Publisher] 发送失败：{} result={}", msg, result);
                     // 生产环境应根据 result 具体值判断处理策略（后面 demo04 会详细讲）
                     Thread.yield();
                 }
@@ -149,6 +152,7 @@ public class Demo01HelloAeron {
             // 最后再多 poll 几次，确保没漏掉尾部消息
             for (int i = 0; i < 10; i++) {
                 subscription.poll(fragmentHandler, 10);
+                log.info("[subscription.poll] ：{}", i);
                 Thread.sleep(10);
             }
 

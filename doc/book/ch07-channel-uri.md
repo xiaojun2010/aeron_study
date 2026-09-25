@@ -7,6 +7,33 @@
 - 掌握 `ChannelUriStringBuilder` 优雅构造；
 - 知道每个参数背后的物理意义（sessionId, MTU, term-length, initial-term-id…）。
 
+## 本章速览：URI 长什么样
+
+```
+aeron:udp?endpoint=192.168.1.20:40456|mtu=8192|term-length=16777216|alias=market
+─────  ────                              ──── ──────────────── ─────
+ 前缀  介质        目的地址                  分片   term 大小       别名
+                                          单位     单位=字节
+                    ▲                     ▲
+                    │                     │
+              收方绑定地址             键值对用 | 分隔（不是 &！）
+```
+
+**类比**：URI 像一封信封上的完整地址：介质（陆运/空运）+ 目的地 + 特快专递选项。
+
+```mermaid
+flowchart LR
+    START[需要写 Channel] --> Q{介质?}
+    Q -->|同机| IPC["aeron:ipc"]
+    Q -->|点对点跨机| U1["aeron:udp?endpoint=..."]
+    Q -->|一发多收 LAN| U2["aeron:udp?endpoint=239.x.y.z:port"]
+    Q -->|一发多收 云| U3["aeron:udp?control=...|control-mode=dynamic"]
+    style IPC fill:#caffbf
+    style U1 fill:#a0c4ff
+    style U2 fill:#fdffb6
+    style U3 fill:#ffd6a5
+```
+
 ## 7.1 URI 基本形式
 
 ```

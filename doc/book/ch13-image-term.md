@@ -7,6 +7,27 @@
 - 学会用 Image API 精确控制"从哪里开始 poll"；
 - 知道 stream position 的物理编码方式。
 
+## 本章速览：四个词的层级关系
+
+```mermaid
+flowchart TB
+    STREAM["Stream<br/>(channel + streamId)<br/>逻辑数据流"]
+    STREAM --> SESS_A["Session A<br/>Publisher A 的会话<br/>sessionId=0x1a"]
+    STREAM --> SESS_B["Session B<br/>Publisher B 的会话<br/>sessionId=0x2b"]
+    SESS_A --> LOG_A["Publication.log 文件<br/>3 × term buffer"]
+    SESS_B --> LOG_B["Publication.log 文件<br/>3 × term buffer"]
+    LOG_A --> IMG_A["Image A<br/>(订阅方视角)"]
+    LOG_B --> IMG_B["Image B<br/>(订阅方视角)"]
+    IMG_A --> SUB[Subscription]
+    IMG_B --> SUB
+    POS["stream position<br/>= termId × termLen + termOffset"]
+    IMG_A -.持有.-> POS
+    IMG_B -.持有.-> POS
+    style STREAM fill:#fef3c7
+    style SUB fill:#caffbf
+    style POS fill:#a0c4ff
+```
+
 ## 13.1 一张全景图
 
 ```
@@ -48,6 +69,23 @@ term-length = T bytes（比如 16 MB）
 **回到 term[0] 前，必须确保所有订阅者已经消费过 term[0]**，否则 Publisher 被 BackPressure 挂住。
 
 ## 13.3 Stream Position 的编码
+
+**位打包示意**（64-bit long）：
+
+```
+ 63           32 31           0
+ ┌─────────────┬─────────────┐
+ │   termId    │  termOffset  │
+ │  (32 bit)   │   (32 bit)   │
+ └─────────────┴─────────────┘
+        ▲              ▲
+     term 编号     term 内偏移
+    (0,1,2 循环)   (0 ~ termLen-1)
+
+position = (termId << 32) | termOffset   (概念上)
+       = termId * termLen + termOffset (语义上)
+```
+
 
 一个 64-bit 的 position 里：
 

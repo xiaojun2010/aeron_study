@@ -7,6 +7,47 @@
 - 认识 Cluster 里的关键角色：Consensus Module / Clustered Service / Client / Archive；
 - 明白 Cluster 与普通 Archive/Transport 的关系。
 
+## 本章速览：Cluster 三节点全景
+
+```mermaid
+flowchart TB
+    CLIENT[Client<br/>只跟 Leader 通信]
+
+    subgraph LEADER["Node A (LEADER)"]
+        CMA[Consensus Module<br/>Raft]
+        SVCA["ClusteredService<br/>(你写的状态机)"]
+        ARA[(Archive)]
+        MDA[MediaDriver]
+        CMA --> SVCA
+        SVCA --> ARA
+    end
+
+    subgraph F1["Node B (FOLLOWER)"]
+        CMB[Consensus Module]
+        SVCB[ClusteredService]
+        ARB[(Archive)]
+    end
+
+    subgraph F2["Node C (FOLLOWER)"]
+        CMC[Consensus Module]
+        SVCC[ClusteredService]
+        ARC[(Archive)]
+    end
+
+    CLIENT -->|Ingress| CMA
+    CMA -->|Log Replication MDC| CMB
+    CMA -->|Log Replication MDC| CMC
+    CMB -->|Consensus vote| CMA
+    CMC -->|Consensus vote| CMA
+    CMA -->|Egress| CLIENT
+
+    style LEADER fill:#caffbf
+    style F1 fill:#fdffb6
+    style F2 fill:#fdffb6
+```
+
+**记忆**：每个节点内部都有"Raft 大脑 + 业务状态机 + 本地录像机"三件套；节点之间用 MDC 复制日志。
+
 ## 21.1 Cluster 是什么
 
 **Aeron Cluster** 是基于 Aeron Transport + Archive 实现的 **Raft 复制状态机** 框架。它给你：

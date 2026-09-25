@@ -2,6 +2,28 @@
 
 按现象归类，每条给出诊断步骤和常见修复。
 
+## 本章速览：排错决策树
+
+```mermaid
+flowchart TD
+    START([出问题了]) --> Q1{何时发生?}
+    Q1 -->|启动时| S1[24.1 启动类<br/>ActiveDriverException<br/>连不上 driver<br/>isConnected 卡住]
+    Q1 -->|offer 时| S2[24.2 offer 类<br/>NOT_CONNECTED<br/>BACK_PRESSURED<br/>CLOSED]
+    Q1 -->|收不到 or 丢包| S3[24.3 UDP 类<br/>loss report 增长<br/>多网卡问题<br/>组播不通]
+    Q1 -->|运行时慢| S4[24.4 内存/性能类<br/>CPU 100%<br/>GC pause<br/>term buffer 大]
+    Q1 -->|Cluster 相关| S5[24.5 Cluster 类<br/>选不出 leader<br/>state 分叉<br/>Follower 追不上]
+    Q1 -->|Archive 相关| S6[24.6 Archive 类<br/>启动失败<br/>磁盘满<br/>replay 慢]
+
+    style S1 fill:#fdffb6
+    style S2 fill:#ffd6a5
+    style S3 fill:#a0c4ff
+    style S4 fill:#caffbf
+    style S5 fill:#fef3c7
+    style S6 fill:#fde8e8
+```
+
+**排错心法**：先看 counter（`AeronStat`）→ 再看 driver 日志 → 最后看业务代码。别一上来 review 业务代码。
+
 ## 24.1 启动类
 
 ### 24.1.1 `ActiveDriverException`
