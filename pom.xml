@@ -11,6 +11,7 @@
     <modules>
         <module>aeron</module>
         <module>bilibili</module>
+        <module>quant</module>
     </modules>
 
     <properties>
